@@ -5,6 +5,10 @@
 // 使い方:
 //   node tools/shot.mjs capture --ref <commit|''> --quality mid|high --out <出力先ディレクトリ> --tag <名前>
 //     → 既定の3カメラ(default/close/low45)で1280x800のPNGを撮る(<out>/<tag>-<カメラ>.png)
+//   node tools/shot.mjs terrain --quality mid|high --out <出力先ディレクトリ> --tag <名前> [--ref <commit>]
+//     → 地形ごとに最初のマスへ寄った1枚(<out>/<地形>-<tag>.png。森・牧草地・麦畑・丘・山・砂漠)
+//   node tools/shot.mjs frame [--ref <commit>] [--gpu 1] → 中・高のフレーム時間(参考値)
+//   (capture/terrainに --query "&x=1" を付けると撮影URLに足す。調べもの用)
 //   node tools/shot.mjs compare --out <png> --set "ラベル:ref=<commit>,q=<mid|high>" --set "ラベル2:..." ...
 //     → 複数の組をまとめて撮り、ラベル付きで並べた1枚を作る(行=組、列=カメラ)
 //
@@ -122,20 +126,24 @@ function resolveTreeDir(ref) {
 
 async function withBrowser(fn) {
   const { chromium } = await import(PW_ENTRY);
-  const browser = await chromium.launch();
+  // --gpu: 実機のGPU(macOSならMetal)で描かせる。付けないと既定の(遅い)描画になり、フレーム時間は参考にならない
+  const browser = await chromium.launch(args.gpu ? { args: ['--use-angle=metal', '--enable-gpu-rasterization', '--ignore-gpu-blocklist'] } : {});
   try { return await fn(browser); } finally { await browser.close(); }
 }
 
 // 1カメラぶんを撮る: localStorageに決まった盤を仕込んでから開き、「つづきから」を押して盤面に入る。
 async function shootOne(browser, base, quality, cam) {
   const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  // コンソールのエラー・警告(シェーダのコンパイル失敗など)はそのまま端末に出す
+  page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log(`[${m.type()}]`, m.text().slice(0, 2000)); });
+  page.on('pageerror', (e) => console.log('[pageerror]', e.message));
   const { game, seats } = buildFixedGame();
   await page.addInitScript(([g, s]) => {
     localStorage.setItem('catan-3d.game', JSON.stringify(g));
     localStorage.setItem('catan-3d.gameSeats', JSON.stringify(s));
     localStorage.setItem('catan-3d.motion', 'false'); // 比較画像がちらつかないよう、撮影中は動き(波・風)を止める
   }, [game, seats]);
-  const url = `${base}/?q=${quality}&cam=${encodeURIComponent(camParam(cam))}`;
+  const url = `${base}/?q=${quality}&cam=${encodeURIComponent(camParam(cam))}${EXTRA_QUERY}`;
   await page.goto(url, { waitUntil: 'load' });
   const continueBtn = page.locator('#continueBtn');
   await continueBtn.waitFor({ state: 'visible', timeout: 5000 });
@@ -238,6 +246,32 @@ async function cmdCompare(args) {
   });
 }
 
+// 地形ごとの寄り: そのマスの中心を斜め上(約45°)から、マスが画面いっぱいになる距離で見る
+async function cmdTerrain(args) {
+  const outDir = args.out || path.join(HUB, '.audit');
+  fs.mkdirSync(outDir, { recursive: true });
+  const { game } = buildFixedGame();
+  const { dir, cleanup } = resolveTreeDir(args.ref || '');
+  try {
+    await withBrowser(async (browser) => {
+      const server = await serveDir(dir);
+      const base = `http://127.0.0.1:${server.address().port}`;
+      for (const terrain of ['forest', 'pasture', 'field', 'hills', 'mountains', 'desert']) {
+        const hex = game.board.hexes.find((h) => h.terrain === terrain);
+        if (!hex) continue;
+        const vs = hex.vertexIds.map((id) => game.board.vertices[id]);
+        const cx = vs.reduce((a, v) => a + v.x, 0) / vs.length * SCALE, cz = vs.reduce((a, v) => a + v.y, 0) / vs.length * SCALE;
+        const cam = { pos: [cx, 125, cz + 105], tgt: [cx, 14, cz] };
+        const buf = await shootOne(browser, base, args.quality || 'mid', cam);
+        const file = path.join(outDir, `${terrain}-${args.tag || 'shot'}.png`);
+        fs.writeFileSync(file, buf);
+        console.log('書いた:', file);
+      }
+      server.close();
+    });
+  } finally { cleanup(); }
+}
+
 async function cmdFrame(args) {
   // 参考値: 中/高のフレーム時間を数秒測る(フレームを連続ではかるだけの簡易測定)
   const { dir, cleanup } = resolveTreeDir(args.ref || '');
@@ -253,6 +287,7 @@ async function cmdFrame(args) {
           localStorage.setItem('catan-3d.gameSeats', JSON.stringify(s));
         }, [game, seats]);
         await page.goto(`${base}/?q=${quality}`, { waitUntil: 'load' });
+        if (quality === 'mid') console.log('GPU:', await page.evaluate(() => { const gl = document.createElement('canvas').getContext('webgl2'); const d = gl && gl.getExtension('WEBGL_debug_renderer_info'); return d ? gl.getParameter(d.UNMASKED_RENDERER_WEBGL) : '?'; }));
         await page.locator('#continueBtn').click();
         await page.waitForTimeout(1500);
         const ms = await page.evaluate(() => new Promise((resolve) => {
@@ -270,7 +305,10 @@ async function cmdFrame(args) {
 
 const [, , cmd, ...rest] = process.argv;
 const args = parseArgs(rest);
+// --query "&foo=1" で撮影URLに任意のクエリを足せる(調べもの用)
+var EXTRA_QUERY = args.query || '';
 if (cmd === 'capture') await cmdCapture(args);
 else if (cmd === 'compare') await cmdCompare(args);
 else if (cmd === 'frame') await cmdFrame(args);
-else { console.error('使い方: shot.mjs capture|compare|frame ...'); process.exit(1); }
+else if (cmd === 'terrain') await cmdTerrain(args);
+else { console.error('使い方: shot.mjs capture|compare|frame|terrain ...'); process.exit(1); }

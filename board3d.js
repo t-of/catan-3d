@@ -33,7 +33,7 @@ const Q = {
   high: { cell: 2.6, maxGrid: 400, shadowMap: 4096, gtaoSamples: 16, bloom: true, dprCap: 2.5 }, // 盤全体で512x512以上(ブリーフの要求)
 }[QUALITY];
 // 太陽の向き(午後の低い角度)。方位はカメラが見やすい斜め後ろから、高度25-35°
-const SUN_AZIMUTH = Math.PI * 0.64;
+const SUN_AZIMUTH = Math.PI * 0.9; // ③: 正面からの順光だと起伏がのっぺり見えたので、左からの斜光(影が右へ伸びる)にした
 const SUN_ELEVATION = Math.PI / 180 * 29;
 // マス中心の座標+地形idをシェーダへ渡す上限(5-6人拡張込みの最大枚数30に余裕を見た数)
 const MAX_LAND_HEXES = 36;
@@ -81,38 +81,57 @@ let hasDebugCam = false; // ?camが指定されていたら、frameCamera()で�
 let oceanUniforms = null;
 let landUniforms = null;
 let vegUniforms = { uTime: { value: 0 } }; // 木・麦・羊など小物の風の揺れ共通(全部の材質で使い回す)
-let terrainField = null; // 地形の高さ・地形idを任意の(x,z)で引けるもの(盤の形が変わるたびに作り直す)
+let vegGroup = null, vegSignature = null; // 植生と小物(盤の形・霧が変わったときだけ作り直す)
+let terrainField = null;
+let terrainGrid = null; // 地形メッシュの格子(groundYが描いた面の高さを引く) // 地形の高さ・地形idを任意の(x,z)で引けるもの(盤の形が変わるたびに作り直す)
 let composer = null; // EffectComposer(GTAO/ブルーム/LUT/SMAA/OutputPass)。renderer.render直接呼びはしない
 let gtaoPass = null, bloomPass = null;
 
 // ---- 共通ジオメトリ（使い回す。インスタンスごとに作らない） ----
-// ③: 単純図形(円錐1個の木・球1個の羊)はやめ、どれも2〜3パーツの組み合わせにした。
-// 縮尺は1マス数百m相当なので、個々のパーツは小さくInstancedMeshで数百〜数千個並べる前提の大きさ。
+// 縮尺: 1マス(辺から辺まで約114単位)を数百m四方とみなし、1単位≒2.5m。木の林冠は直径3〜4単位(8〜10m)、
+// 羊は体長1単位(2.5m弱。既定のカメラで白い点になる程度)。どれも小さく、InstancedMeshで大量に並べる。
+// 単純図形(円錐1個の木・球1個の羊)の見た目を避けるため、林冠はでこぼこに歪めた球、針葉樹は2段の円錐、
+// 羊は胴を引き伸ばした球にしている(どれも滑らかな法線。flatShadingは使わない)。
+function lumpy(geo, amp, seed) { // 頂点を位置の関数でずらす(同じ位置の頂点は同じだけ動くので継ぎ目が割れない)
+  const p = geo.attributes.position;
+  for (let i = 0; i < p.count; i++) {
+    const x = p.getX(i), y = p.getY(i), z = p.getZ(i);
+    const f = 1 + amp * (Math.sin(x * 3.1 + y * 1.7 + seed) * Math.cos(z * 2.3 - y * 1.1 + seed * 0.7) + Math.sin(x * 5.3 - z * 4.1) * 0.4);
+    p.setXYZ(i, x * f, y * f, z * f);
+  }
+  geo.computeVertexNormals();
+  return geo;
+}
+function conifer() { // 針葉樹: 下段の広い円錐+上段の細い円錐(1つのジオメトリにまとめる)
+  const a = new THREE.ConeGeometry(1.5, 3.6, 8, 1, true).translate(0, -0.7, 0);
+  const b = new THREE.ConeGeometry(1.05, 3.0, 8, 1, true).translate(0, 1.2, 0);
+  const pos = [...a.attributes.position.array, ...b.attributes.position.array];
+  const idx = [...a.index.array, ...b.index.array.map((v) => v + a.attributes.position.count)];
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  return lumpy(g, 0.06, 2);
+}
 const GEO = {
-  conTrunk: new THREE.CylinderGeometry(0.5, 0.7, 3.4, 6), // 針葉樹の幹(細い)
-  conCanopy: new THREE.ConeGeometry(2.5, 6, 8), // 針葉樹の樹冠
-  broadTrunk: new THREE.CylinderGeometry(0.6, 0.9, 2.2, 6), // 広葉樹の幹(短く太い)
-  broadCanopy: smoothGeo(new THREE.IcosahedronGeometry(2.5, 1)), // 広葉樹の樹冠(丸い塊。低ポリ球よりいびつ)
-  sheepBody: smoothGeo(new THREE.IcosahedronGeometry(1.3, 1)).scale(1, 0.78, 1.15),
-  sheepHead: new THREE.SphereGeometry(0.55, 6, 5),
-  fencePost: new THREE.CylinderGeometry(0.22, 0.25, 1.8, 5),
-  fenceRail: new THREE.BoxGeometry(1, 0.16, 0.14),
-  fieldRock: new THREE.DodecahedronGeometry(0.55, 0),
-  wheat: new THREE.ConeGeometry(0.75, 2.8, 6), // 麦の束(短冊の畝の上に並べる)
-  brick: new THREE.BoxGeometry(1.1, 0.6, 0.6),
-  kilnBody: new THREE.CylinderGeometry(2.4, 2.8, 3.6, 8),
-  kilnRoof: new THREE.ConeGeometry(2.9, 1.8, 8),
-  smoke: smoothGeo(new THREE.IcosahedronGeometry(1, 1)),
-  // 頂上の雪: 地形(尾根)の上に貼りつく丸い雪だまり(単純な円錐は使わない。低い円錐台のいびつな塊)
-  snowPatch: smoothGeo(new THREE.IcosahedronGeometry(3.6, 1)).scale(1, 0.45, 1),
-  scree: new THREE.DodecahedronGeometry(0.9, 0),
-  mineFrame: new THREE.BoxGeometry(3.6, 4, 1.4),
-  mineHole: new THREE.BoxGeometry(2.2, 2.6, 0.4),
-  rail: new THREE.BoxGeometry(1, 0.14, 0.16),
-  tie: new THREE.BoxGeometry(1.4, 0.14, 0.5),
-  dune: new THREE.ConeGeometry(10, 3.4, 12),
-  dryGrass: new THREE.ConeGeometry(0.3, 1.5, 5),
-  desertRock: new THREE.DodecahedronGeometry(0.8, 0),
+  conCanopy: conifer(), // 高さ約5.2(地面から立てる)
+  broadCanopy: lumpy(new THREE.SphereGeometry(1.9, 10, 7), 0.16, 1).scale(1, 0.78, 1), // 広葉樹の林冠
+  bush: lumpy(new THREE.SphereGeometry(0.85, 7, 5), 0.18, 5).scale(1, 0.8, 1), // 生け垣・低木
+  sheepBody: new THREE.SphereGeometry(0.4, 7, 5).scale(1, 0.75, 1.35),
+  fencePost: new THREE.CylinderGeometry(0.12, 0.14, 1.1, 5),
+  fenceRail: new THREE.BoxGeometry(1, 0.08, 0.08),
+  fieldRock: smoothGeo(lumpy(new THREE.SphereGeometry(0.5, 6, 4), 0.25, 9)).scale(1, 0.6, 1),
+  brickStack: new THREE.BoxGeometry(1.3, 1.0, 1.3), // レンガを積んだパレット1つ
+  kilnHall: new THREE.BoxGeometry(9, 2.4, 3.6), // 窯場の細長い建屋(輪窯)
+  kilnRoof: new THREE.CylinderGeometry(1.9, 1.9, 9.2, 3, 1).rotateZ(Math.PI / 2), // 切妻屋根(三角柱)
+  chimney: new THREE.CylinderGeometry(0.45, 0.65, 10, 8),
+  smoke: smoothGeo(new THREE.IcosahedronGeometry(1, 2)),
+  scree: smoothGeo(lumpy(new THREE.SphereGeometry(0.7, 6, 4), 0.3, 3)).scale(1, 0.65, 1),
+  mineFrame: new THREE.BoxGeometry(3.0, 2.8, 1.2),
+  mineHole: new THREE.BoxGeometry(1.8, 1.9, 0.4),
+  rail: new THREE.BoxGeometry(1, 0.12, 0.14),
+  tie: new THREE.BoxGeometry(1.3, 0.12, 0.4),
+  dryGrass: lumpy(new THREE.SphereGeometry(0.4, 6, 4), 0.3, 7).scale(1, 0.5, 1),
+  desertRock: smoothGeo(lumpy(new THREE.SphereGeometry(0.8, 7, 5), 0.3, 11)).scale(1, 0.55, 1),
   nugget: new THREE.OctahedronGeometry(3.4, 0),
   road: new THREE.CylinderGeometry(3.4, 3.4, 1, 8), // 角を落とした木の棒(断面が八角形の丸太)。長さはmeshのscale.yで伸ばす
   dockPlank: new THREE.BoxGeometry(2.2, 0.4, 1.3),
@@ -120,70 +139,73 @@ const GEO = {
   boatSail: new THREE.ConeGeometry(1.6, 3.6, 3),
   signPost: new THREE.CylinderGeometry(0.22, 0.26, 3.4, 6),
   signBoard: new THREE.BoxGeometry(3.2, 1.8, 0.2),
-  hedge: new THREE.BoxGeometry(1, 1.1, 0.9),
-  wallStone: new THREE.BoxGeometry(1, 0.95, 0.85),
-  pathTile: new THREE.BoxGeometry(1, 0.08, 1.1),
-  streamTile: new THREE.BoxGeometry(1, 0.05, 1.3),
+  wallStone: new THREE.BoxGeometry(1.05, 0.75, 0.8), // 石垣の一区切り
+  pathTile: new THREE.BoxGeometry(1.1, 0.1, 2.0), // 土の農道
+  streamTile: new THREE.BoxGeometry(1.1, 0.06, 1.5), // 細い小川
 };
 function smoothGeo(g) { g.computeVertexNormals(); return g; }
 const MAT = {
-  conBark: new THREE.MeshStandardMaterial({ color: 0x4a3420, roughness: 0.95 }),
-  conLeaf: new THREE.MeshStandardMaterial({ color: 0x386b46, roughness: 0.9 }),
-  broadBark: new THREE.MeshStandardMaterial({ color: 0x5b3a22, roughness: 0.95 }),
-  broadLeaf: new THREE.MeshStandardMaterial({ color: 0x4f8a44, roughness: 0.9 }),
-  sheep: new THREE.MeshStandardMaterial({ color: 0xf4f1e6, roughness: 0.85 }),
-  sheepHead: new THREE.MeshStandardMaterial({ color: 0x7a6a56, roughness: 0.8 }),
-  fence: new THREE.MeshStandardMaterial({ color: 0x8a6d46, roughness: 0.9 }),
-  fieldRock: new THREE.MeshStandardMaterial({ color: 0x9a9183, roughness: 0.95 }),
-  wheat: new THREE.MeshStandardMaterial({ color: 0xe4b63e, roughness: 0.8 }),
-  brick: new THREE.MeshStandardMaterial({ color: 0xa6502f, roughness: 0.92 }),
-  kiln: new THREE.MeshStandardMaterial({ color: 0x8a6a54, roughness: 0.95 }),
-  smoke: new THREE.MeshStandardMaterial({ color: 0xd8d6d0, roughness: 1, transparent: true, opacity: 0.4 }),
-  snow: new THREE.MeshStandardMaterial({ color: 0xf4f8ff, roughness: 0.7 }),
-  scree: new THREE.MeshStandardMaterial({ color: 0x81868f, roughness: 0.95 }),
+  conLeaf: new THREE.MeshStandardMaterial({ color: 0x223a2a, roughness: 0.92 }),
+  broadLeaf: new THREE.MeshStandardMaterial({ color: 0x3a5226, roughness: 0.9 }),
+  bush: new THREE.MeshStandardMaterial({ color: 0x34492a, roughness: 0.92 }),
+  sheep: new THREE.MeshStandardMaterial({ color: 0xf2eee2, roughness: 0.9 }),
+  fence: new THREE.MeshStandardMaterial({ color: 0x7d6446, roughness: 0.9 }),
+  fieldRock: new THREE.MeshStandardMaterial({ color: 0x8f8b80, roughness: 0.95 }),
+  brick: new THREE.MeshStandardMaterial({ color: 0x9c4a2c, roughness: 0.92 }),
+  kiln: new THREE.MeshStandardMaterial({ color: 0x8a5a40, roughness: 0.95 }),
+  kilnRoof: new THREE.MeshStandardMaterial({ color: 0x5b4a40, roughness: 0.85 }),
+  smoke: new THREE.MeshStandardMaterial({ color: 0xd6d4ce, roughness: 1, transparent: true, opacity: 0.4, depthWrite: false }),
+  scree: new THREE.MeshStandardMaterial({ color: 0x6b675f, roughness: 0.95 }),
   mineFrame: new THREE.MeshStandardMaterial({ color: 0x5b4226, roughness: 0.9 }),
   mineHole: new THREE.MeshStandardMaterial({ color: 0x100d0a, roughness: 1 }),
   rail: new THREE.MeshStandardMaterial({ color: 0x5a5a5a, roughness: 0.6, metalness: 0.4 }),
   tie: new THREE.MeshStandardMaterial({ color: 0x4a3420, roughness: 0.9 }),
-  sand: new THREE.MeshStandardMaterial({ color: 0xdfc688, roughness: 1 }),
-  dryGrass: new THREE.MeshStandardMaterial({ color: 0xb8a157, roughness: 0.9 }),
-  desertRock: new THREE.MeshStandardMaterial({ color: 0xaa9877, roughness: 0.95 }),
+  dryGrass: new THREE.MeshStandardMaterial({ color: 0x7d6e42, roughness: 0.95 }),
+  desertRock: new THREE.MeshStandardMaterial({ color: 0x6f5f4c, roughness: 0.95 }),
   gold: new THREE.MeshStandardMaterial({ color: 0xf0c83c, roughness: 0.4, metalness: 0.6, emissive: 0x4a3a00 }),
   dock: new THREE.MeshStandardMaterial({ color: 0x7a5c38, roughness: 0.9 }),
   boatHull: new THREE.MeshStandardMaterial({ color: 0x4a3420, roughness: 0.85 }),
   signPost: new THREE.MeshStandardMaterial({ color: 0x6e5436, roughness: 0.9 }),
-  hedge: new THREE.MeshStandardMaterial({ color: 0x3f6b3a, roughness: 0.9 }),
-  wallStone: new THREE.MeshStandardMaterial({ color: 0x8d897e, roughness: 0.95 }),
-  path: new THREE.MeshStandardMaterial({ color: 0x7a6a4d, roughness: 1 }),
-  stream: new THREE.MeshStandardMaterial({ color: 0x3a90a8, roughness: 0.3, transparent: true, opacity: 0.85 }),
+  wallStone: new THREE.MeshStandardMaterial({ color: 0x9a968c, roughness: 0.95 }),
+  path: new THREE.MeshStandardMaterial({ color: 0x8c7752, roughness: 1 }),
+  stream: new THREE.MeshStandardMaterial({ color: 0x2c5056, roughness: 0.15, metalness: 0.1 }),
 };
-// 密度・サイズは本物の縮尺(1マス=数百m)に合わせて小さく大量に置く。画質(中/高)で数だけ変える。
+// 密度は画質(中/高)で数だけ変える(大きさは変えない)。森は詰めすぎても見た目が変わらないので頭打ちにする
 const DENSITY = { mid: 1, high: 3.4 }[QUALITY];
+const FOREST_DENSITY = Math.min(DENSITY, 2.2);
 
 // 風の揺れ(頂点シェーダ)。InstancedMeshの各個体ごとに位相をずらし(instanceMatrixの位置から)、
 // ジオメトリの上のほう(position.yが大きいところ)ほど大きく揺らす。「動き オフ」ではuTimeの更新を
 // 止める(animate()参照)ので、自然に止まる(このシェーダ自体に有効フラグは持たせない)。
-function applyWindSway(mat, heightRef, amp, freq) {
+// aoが0より大きいと、林冠の下ほど暗くする(葉の塊の内側の陰。空撮で木の粒が立体に見えるように)。
+function applyWindSway(mat, heightRef, amp, freq, ao) {
+  // three.jsはonBeforeCompileの関数の文字列でシェーダを使い回すので、値が違う材質どうしを区別させる
+  mat.customProgramCacheKey = () => `sway:${heightRef}:${amp}:${freq}:${ao}`;
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, vegUniforms);
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nuniform float uTime;')
+      .replace('#include <common>', '#include <common>\nuniform float uTime;\nvarying float vCrown;')
       .replace('#include <begin_vertex>', `#include <begin_vertex>
         #ifdef USE_INSTANCING
           float windPhase = instanceMatrix[3].x * 0.07 + instanceMatrix[3].z * 0.05;
         #else
           float windPhase = 0.0;
         #endif
-        float windLift = clamp(position.y / ${heightRef.toFixed(2)}, 0.0, 1.0);
+        vCrown = clamp(position.y / ${heightRef.toFixed(2)} * 0.5 + 0.5, 0.0, 1.0);
+        float windLift = clamp(position.y / ${heightRef.toFixed(2)} + 0.5, 0.0, 1.0);
         windLift *= windLift;
         transformed.x += sin(uTime * ${freq.toFixed(2)} + windPhase) * ${amp.toFixed(2)} * windLift;
         transformed.z += cos(uTime * ${(freq * 0.82).toFixed(2)} + windPhase) * ${(amp * 0.6).toFixed(2)} * windLift;`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying float vCrown;')
+      .replace('#include <color_fragment>', `#include <color_fragment>
+        diffuseColor.rgb *= mix(${(1 - ao).toFixed(2)}, 1.06, vCrown);`);
   };
 }
-applyWindSway(MAT.conLeaf, 3.0, 0.22, 1.1);
-applyWindSway(MAT.broadLeaf, 2.5, 0.26, 1.0);
-applyWindSway(MAT.wheat, 1.4, 0.16, 2.2);
-applyWindSway(MAT.dryGrass, 0.75, 0.1, 1.6);
+applyWindSway(MAT.conLeaf, 2.6, 0.06, 1.1, 0.55);
+applyWindSway(MAT.broadLeaf, 1.5, 0.07, 1.0, 0.5);
+applyWindSway(MAT.bush, 0.7, 0.03, 1.3, 0.45);
+applyWindSway(MAT.dryGrass, 0.2, 0.03, 1.6, 0.3);
 const TERRAIN_MAT = {}; // 地形ごとのタイル材質(一度作ったら使い回す)。terrainTextures()の結果と対応
 
 function clampUnit(v) { return Math.min(1, Math.max(0, v)); }
@@ -203,9 +225,9 @@ function buildColorLUT(size) {
         R = luma + (R - luma) * SAT; G = luma + (G - luma) * SAT; B = luma + (B - luma) * SAT;
         const shadowW = 1 - smoothstep(0.12, 0.5, luma); // 暗部ほど強く青みを足す
         const highW = smoothstep(0.5, 0.92, luma); // 明部ほど強く暖色を足す
-        R += highW * 0.045 - shadowW * 0.025;
-        G += highW * 0.015 - shadowW * 0.01;
-        B += highW * -0.035 + shadowW * 0.06;
+        R += highW * 0.03 - shadowW * 0.008;
+        G += highW * 0.014 - shadowW * 0.002;
+        B += highW * -0.025 + shadowW * 0.024;
         // 全体に軽いS字(中間調を少し締める)でコントラストを足す。霞んで見える対策
         R = R + (R - 0.5) * 0.05; G = G + (G - 0.5) * 0.05; B = B + (B - 0.5) * 0.05;
         const idx = (b * size * size + g * size + r) * 4;
@@ -278,9 +300,13 @@ export function initBoard3D(container, onTap) {
     pmrem.dispose();
   }, undefined, () => { pmrem.dispose(); });
 
-  scene.add(new THREE.HemisphereLight(0xdceeff, 0x24321e, 0.55));
+  // ③の直し: 岩・粘土が紫〜ラベンダーに見えていた原因は、青い空の光(晴天のHDRIの環境光+青い半球光)が
+  // 太陽の暖色(赤寄り)と重なって緑だけが足りなくなる(赤+青=紫)ことと、LUTが影を青く・赤を引いていたこと。
+  // 環境光を弱め(scene.environmentIntensity)、半球光をほぼ無彩色にし、太陽は緑を残した暖白にした。
+  scene.environmentIntensity = 0.5;
+  scene.add(new THREE.HemisphereLight(0xe4ecf2, 0x3c3a2a, 0.42));
   // 午後の低い太陽。暖色だが地形の色そのものを赤く染めないよう、彩度は控えめな暖白にする
-  sun = new THREE.DirectionalLight(0xfff0d6, 1.7);
+  sun = new THREE.DirectionalLight(0xfff4e4, 2.1);
   sun.castShadow = true;
   sun.shadow.mapSize.set(Q.shadowMap, Q.shadowMap);
   sun.shadow.bias = -0.00018;
@@ -483,8 +509,12 @@ function instancedFrom(geo, mat, items, variance) {
     mesh.setMatrixAt(i, m4);
     if (variance) {
       const r = it.seed != null ? hexRng(it.seed) : rand;
-      mesh.setColorAt(i, new THREE.Color().setHSL(
-        hsl.h + r(-variance, variance), clampUnit(hsl.s + r(-0.06, 0.06)), clampUnit(hsl.l + r(-0.1, 0.1))));
+      // instanceColorは材質の色に掛け算される。ずらした色そのものを入れると色が2乗されて真っ黒に近く
+      // なる(木・生け垣が黒く見えた原因)ので、材質の色に対する比を入れる。
+      const c = new THREE.Color().setHSL(
+        hsl.h + r(-variance, variance), clampUnit(hsl.s + r(-0.06, 0.06)), clampUnit(hsl.l * r(0.8, 1.2)));
+      const b = mat.color;
+      mesh.setColorAt(i, c.setRGB(c.r / Math.max(b.r, 1e-4), c.g / Math.max(b.g, 1e-4), c.b / Math.max(b.b, 1e-4)));
     }
   });
   mesh.castShadow = true; mesh.receiveShadow = true;
@@ -526,7 +556,10 @@ function valueNoise2(x, z, seed) {
   const a = v00 + (v10 - v00) * sx, b = v01 + (v11 - v01) * sx;
   return a + (b - a) * sz;
 }
-function fbm(x, z, seed, freq, oct, lac, gain) {
+// 引数の順は(周波数, 種)。③の直し: 以前は宣言が(種, 周波数)で、呼び出し側は全部(周波数, 種)の順に
+// 渡していたため、周波数に種(42や数万)が入って頂点ごとにでたらめな高さになっていた
+// (地面が丸めた紙のようなしわ、海岸線のギザギザの原因)。
+function fbm(x, z, freq, seed, oct, lac, gain) {
   lac = lac ?? 2; gain = gain ?? 0.5;
   let amp = 1, f = freq, sum = 0, norm = 0;
   for (let i = 0; i < oct; i++) {
@@ -556,23 +589,41 @@ function coastNoise(x, z) { return fbm(x, z, 0.0055, 999, 2); }
 function terrainBump(terrain, x, z, seed, hcx, hcz) {
   const island = fbm(x, z, 0.0035, 42, 2) * 3; // 島全体を通る緩いうねり(マスをまたぐ大きな起伏)
   switch (terrain) {
-    case 'forest': return island + fbm(x, z, 0.012, seed, 3) * 2.6 + fbm(x, z, 0.045, seed + 50, 2) * 0.9; // 林冠のでこぼこ
-    case 'pasture': return island + fbm(x, z, 0.011, seed, 2) * 1.8; // 草地のゆるい起伏
-    case 'field': return island + fbm(x, z, 0.009, seed, 2) * 0.8; // 畑はなだらか
+    case 'forest': return island + fbm(x, z, 0.012, seed, 3) * 3.4 + fbm(x, z, 0.045, seed + 50, 2) * 0.9; // 林冠のでこぼこ
+    case 'pasture': return island + fbm(x, z, 0.011, seed, 3) * 4.2; // 草地のゆるい起伏(なだらかな丘)
+    case 'field': return island + fbm(x, z, 0.009, seed, 2) * 1.6; // 畑はなだらか
     case 'hills': { // 採掘場の段々(掘削跡): マス中心からの同心円を階段状にする(ノイズ任せだと段が
       // 細かく割れてトゲトゲに見えたり、マスによっては段差が1つも視野に入らなかったりしたため、
       // マスごとに必ず2〜3段できる同心円の階段にする。外側ほど高い(採掘で中心が掘り下がった形)
-      const r = Math.hypot(x - hcx, z - hcz);
+      const r = hillsRingRadius(x - hcx, z - hcz, seed);
       const ring = Math.floor(clampUnit(r / (SCALE * 0.62)) * 3.4) * 2.4;
       return island + ring + valueNoise2(x * 0.02, z * 0.02, seed) * 0.5; // 段の面にもわずかな荒れを足す
     }
-    case 'mountains': return island + ridged(x, z, seed, 0.016, 4) * 34 + 22; // 山だけ急(尾根・崖)
-    case 'desert': {
-      const a = 0.4, rx = x * Math.cos(a) - z * Math.sin(a);
-      return island + Math.sin(rx * 0.02 + seed) * 1.6 + fbm(x, z, 0.035, seed + 7, 2) * 0.7; // 風紋
+    case 'mountains': { // 山だけ急(尾根・崖)。マスの縁へ向かって裾野に落とす(六角の台地に見えないように)
+      // 数字の石碑を置く頂(マス中心のまわり)は平らにして、岩や雪に埋もれさせない
+      const r = Math.hypot(x - hcx, z - hcz);
+      const peak = (px, pz) => ridged(px, pz, seed, 0.016, 4) * 30 + 18 + ridged(px, pz, seed + 9, 0.038, 3) * 14 + ridged(px, pz, seed + 17, 0.1, 2) * 3;
+      const taper = 1 - 0.8 * smoothstep(0.3, 1.0, r / HEX_R);
+      // 頂から放射状に下る尾根と沢(浸食の筋)。角度の整数倍なので一周してもつながる
+      const a = Math.atan2(z - hcz, x - hcx);
+      const gully = (Math.abs(Math.sin(a * 7 + fbm(x, z, 0.03, seed + 5, 2) * 3)) - 0.5) * 7 * smoothstep(12, 40, r);
+      return island + lerp(peak(hcx, hcz), (peak(x, z) + gully) * taper, smoothstep(14, 26, r)); // 2つ目以降は沢と小尾根
+    }
+    case 'desert': { // 風下側が急な砂丘の列(波長40単位ほど)。数字の石碑のまわりは平らにして埋もれさせない
+      const a = 0.4, rx = x * Math.cos(a) - z * Math.sin(a) + fbm(x, z, 0.02, seed + 3, 2) * 18;
+      const t = rx * 0.15 + seed;
+      const dune = (Math.sin(t) + 0.35 * Math.sin(2 * t + 1.2)) * 3.2;
+      const calm = smoothstep(17, 30, Math.hypot(x - hcx, z - hcz));
+      return island + dune * calm + fbm(x, z, 0.035, seed + 7, 2) * 0.7;
     }
     default: return island + fbm(x, z, 0.015, seed, 2) * 1.6; // gold/castle/pitch/lake/fogなど拡張の特殊地形
   }
+}
+// 丘の採掘場の段の半径(同心円を少し波打たせる)。地面のシェーダ(hillsColor)にも同じ式を書いてある。
+function hexSeedW(seed) { return (seed % 1000) / 1000; } // マスごとの0〜1の種(シェーダへも同じ値を渡す)
+function hillsRingRadius(dx, dz, seed) {
+  const w = hexSeedW(seed), a = Math.atan2(dz, dx);
+  return Math.hypot(dx, dz) + Math.sin(a * 2 + w * 6.2832) * 4.5 + Math.sin(a * 3 + w * 12) * 3 + Math.sin(a * 7 + w * 20) * 1.2;
 }
 function terrainIdOf(terrain) { const i = TERRAIN_NAMES.indexOf(terrain); return i >= 0 ? i : 1; } // 不明な地形はpasture代用
 
@@ -705,107 +756,193 @@ function terrainTextures(name) {
   return out;
 }
 // ================================================================
-// 陸地材質(1枚のシェーダで全地形をまかなう): 頂点ごとに持つ terrainA/terrainB/mixT(隣り合う2マスの
-// 地形とその混ざり具合)・slope(頂点法線の傾き。0=平ら〜1=垂直)・coastW(渚の砂への寄せ具合)を
-// フラグメントシェーダへ渡し、6種の地形テクスチャから選んで混ぜる。
-// スケール違いの2層(そのまま/少し拡大+オフセット)をUV由来のハッシュノイズで混ぜ、繰り返しを消す。
-// 斜面の岩肌への切り替え(slope)は、ここでだけ smoothstep(SLOPE_LO, SLOPE_HI, ...) にして
-// 三角形単位のカクつきが出ないようにする(ブリーフの要求そのもの)。
-// ponytail: 法線マップ・ARM(AO/粗さ)は地形ごとのブレンドまではせず、共有の1枚(pasture)を使い回す。
-// 質感の違いがもっと欲しくなったら、ここに同じ6分岐のブレンドを足す(diffuseと同じやり方でできる)。
+// 陸地材質(1枚のシェーダで全地形をまかなう)。③の直し: 地形の色は「CC0テクスチャの色×tint」をやめ、
+// 実際の空撮写真から拾った地形ごとの色(線形空間のアルベド)を土台にし、テクスチャは平均色で割った
+// 「濃淡の比」としてだけ掛ける(麦畑の元テクスチャが暗い土なので、tintを掛けても茶色にしかならなかった)。
+// そのうえで、麦畑の短冊・あぜ道・畝とトラクターの轍、丘の段々の掘削跡、山のがれ場・崖・雪、
+// 砂漠の風紋をマスごとの座標系で描く。マスごとの情報(中心・地形id・水か・畑の向き・種)は
+// updateLandHexUniforms()が書き込む。
+// 最寄り2マスの地形idとブレンド具合は、頂点グリッドの粗さに縛られないよう毎ピクセル求める。
 // ================================================================
+const HEX_BLEND_COLOR = 4.5; // 地形の色を混ぜる幅(起伏を混ぜる幅HEX_BLENDより狭くして区画をはっきりさせる)
 function buildLandMaterial() {
   const sets = TERRAIN_NAMES.map((n) => terrainTextures(n));
   sets.forEach((tx) => { tx.map.repeat.set(1, 1); });
   const sharedNormal = sets[1].normalMap; // pastureの法線を共有(リピートは細かめ)
   sharedNormal.repeat.set(5, 5);
-  const mat = new THREE.MeshStandardMaterial({ normalMap: sharedNormal, roughness: 0.95, metalness: 0.02 });
-  // マスの境目(地形id・ブレンド具合)は、頂点グリッドの粗さに縛られないよう頂点属性でなく
-  // フラグメントシェーダ側でマス中心までの距離から毎ピクセル求める(①の残課題: 境目のギザギザ対策)。
-  // マス中心の座標・地形idはupdateLandHexUniforms()が盤の形が変わるたびに書き込む。
+  const mat = new THREE.MeshStandardMaterial({ normalMap: sharedNormal, roughness: 1, metalness: 0 });
+  mat.envMapIntensity = 0.6; // 浅い角度で空の青が映り込んで地面が青紫に転ぶのを抑える
+  // 法線マップは細かい凹凸の手ざわりだけに弱める(強いと低い太陽で地面全体が紙を丸めたようなしわに見えた)
+  mat.normalScale.set(0.3, 0.3);
   landUniforms = {
     uHexXZ: { value: Array.from({ length: MAX_LAND_HEXES }, () => new THREE.Vector2(1e6, 1e6)) },
-    uHexTid: { value: new Array(MAX_LAND_HEXES).fill(1) },
+    uHexInfo: { value: Array.from({ length: MAX_LAND_HEXES }, () => new THREE.Vector4(1, 1, 0, 0)) }, // 地形id, 水か, 畑の向き, 種
     uHexN: { value: 0 },
     uTime: { value: 0 },
   };
+  const texSwitch = (body) => TERRAIN_NAMES.map((_, i) => `${i ? 'else ' : ''}if (id == ${i}) { ${body.replaceAll('TEX', 'uTex' + i)} }`).join('\n          ');
   mat.onBeforeCompile = (shader) => {
     TERRAIN_NAMES.forEach((_, i) => { shader.uniforms['uTex' + i] = { value: sets[i].map }; });
     Object.assign(shader.uniforms, landUniforms);
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>
         attribute float slope; attribute float coastW;
-        varying float vSlope; varying float vCoastW;
+        varying float vSlope; varying float vCoastW; varying float vWorldY;
         varying vec2 vTerrainUv; varying vec2 vWorldXZ;`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
         vSlope = slope; vCoastW = coastW; vTerrainUv = uv;
-        vWorldXZ = (modelMatrix * vec4(transformed, 1.0)).xz;`);
+        vec4 landWorld = modelMatrix * vec4(transformed, 1.0);
+        vWorldXZ = landWorld.xz; vWorldY = landWorld.y;`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>
-        varying float vSlope; varying float vCoastW;
+        varying float vSlope; varying float vCoastW; varying float vWorldY;
         varying vec2 vTerrainUv; varying vec2 vWorldXZ;
-        uniform vec2 uHexXZ[${MAX_LAND_HEXES}]; uniform float uHexTid[${MAX_LAND_HEXES}]; uniform int uHexN; uniform float uTime;
+        uniform vec2 uHexXZ[${MAX_LAND_HEXES}]; uniform vec4 uHexInfo[${MAX_LAND_HEXES}]; uniform int uHexN; uniform float uTime;
         ${TERRAIN_NAMES.map((_, i) => `uniform sampler2D uTex${i};`).join('\n        ')}
         ${CLOUD_GLSL}
-        float detailHash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
-        // 地形ごとの狙った色味へ寄せる(元のCC0テクスチャの素の色だけでは地形が読み分けにくいため)。
-        // テクスチャの濃淡(ディテール)は保ちつつ、色相だけtintへ引っ張る軽いmix。
-        vec3 terrainTint(int id) {
-          if (id == 0) return vec3(0.145, 0.235, 0.130); // forest: 濃い緑
-          if (id == 1) return vec3(0.420, 0.560, 0.260); // pasture: 牧草の緑
-          if (id == 2) return vec3(0.760, 0.610, 0.220); // field: 麦の金色
-          if (id == 3) return vec3(0.620, 0.330, 0.190); // hills: 赤茶の粘土
-          if (id == ${ROCK_ID}) return vec3(0.520, 0.510, 0.520); // mountains: 灰色の岩
-          return vec3(0.820, 0.735, 0.520); // desert: 明るい砂
+        float h21(vec2 p) { return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+        float fbm2(vec2 p) { return cloudNoise(p) * 0.55 + cloudNoise(p * 2.03 + 7.1) * 0.3 + cloudNoise(p * 4.1 + 3.3) * 0.15; }
+        // 細い線(dは線の中心からの距離、wは半幅)。画面上で線が1画素より細いときは、ちらつかないよう薄めて描く
+        float aaLine(float d, float w) {
+          float fw = max(fwidth(d), 1e-4);
+          return (1.0 - smoothstep(w - fw * 0.5, w + fw * 0.5, d)) * clamp(2.0 * w / fw, 0.0, 1.0);
         }
-        vec4 sampleTerrainTex(int id, vec2 uv, vec2 worldXZ) {
-          vec2 uvB = uv * 2.63 + vec2(17.0, 31.0);
-          float n = detailHash(floor(uv * 6.0));
-          float w = smoothstep(0.35, 0.65, n);
-          vec4 tex = texture2D(uTex1, uv);
-          ${TERRAIN_NAMES.map((_, i) => `if (id == ${i}) tex = mix(texture2D(uTex${i}, uv), texture2D(uTex${i}, uvB), w);`).join('\n          ')}
-          float luma = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
-          vec3 toned = mix(vec3(luma), tex.rgb, 0.35) * terrainTint(id) * 1.9;
-          if (id == 2) { // 麦畑: 畝の筋+短冊(畑)ごとの色違い+風でそよぐ明滅
-            float furrow = smoothstep(0.0, 1.0, abs(fract(worldXZ.x * 0.085 + worldXZ.y * 0.02) - 0.5) * 2.0);
-            toned *= mix(0.85, 1.07, furrow);
-            float patchN = detailHash(floor(worldXZ * 0.012));
-            toned *= mix(0.92, 1.08, patchN);
-            toned *= 1.0 + sin(uTime * 1.3 + worldXZ.x * 0.05 + worldXZ.y * 0.05) * 0.035;
-          }
-          if (id == ${SAND_ID}) { // 砂漠: 風紋(砂丘の筋)
-            float ridge = sin(worldXZ.x * 0.07 + sin(worldXZ.y * 0.02) * 2.2) * 0.5 + 0.5;
-            toned *= mix(0.88, 1.07, ridge);
-          }
-          return vec4(toned, tex.a);
+        // 繰り返しの模様(周期per)が画面上で細かくなりすぎたら消す係数(モアレ対策)
+        float aaFade(float coord, float per) { return 1.0 - smoothstep(0.25, 0.6, fwidth(coord) / per); }
+        // テクスチャは「平均色に対する濃淡の比」だけを使う(色そのものは地形ごとのアルベドで決める)。
+        // スケール違いの2層をノイズで混ぜて繰り返しを消す。
+        // 元の写真テクスチャには地面の陰影が焼き込まれているので、大きく引き伸ばすと「丸めた紙のしわ」に見える。
+        // 細かく繰り返して(空からは細かな粒にしか見えない大きさ)、比も弱めに掛ける。
+        vec3 detailRatio(int id, vec2 uv0) {
+          vec2 uv = uv0 * 2.6, uvB = uv0 * 0.9 + vec2(17.0, 31.0);
+          float w = smoothstep(0.3, 0.7, cloudNoise(uv0 * 0.6));
+          vec3 t = vec3(0.5), m = vec3(0.5);
+          ${texSwitch('t = mix(texture(TEX, uv).rgb, texture(TEX, uvB).rgb, w); m = textureLod(TEX, vec2(0.5), 12.0).rgb;')}
+          return clamp(pow(t / max(m, vec3(0.02)), vec3(0.42)), 0.45, 1.8);
         }
-        // 最寄り2マスの地形idとブレンド具合を、マス中心までの距離からその場(毎ピクセル)で求める。
-        // 頂点グリッドの解像度に縛られないので、境目が階段状にならない。
-        void nearestTwoHex(vec2 p, out float id1, out float id2, out float mixT) {
-          float d1 = 1e9, d2 = 1e9; float i1 = 1.0, i2 = 1.0;
+        // 岩肌(山。ほかの地形の急斜面にも使う): 灰色〜灰褐色、緩い所はがれ場、急な所は暗い崖、低い所に高山の草、高い所に雪
+        vec3 rockColor(vec2 p, vec2 uv) {
+          float m = fbm2(p * 0.02);
+          vec3 col = mix(vec3(0.105, 0.10, 0.088), vec3(0.14, 0.122, 0.095), smoothstep(0.35, 0.75, m));
+          float gentle = 1.0 - smoothstep(0.1, 0.32, vSlope);
+          vec3 scree = vec3(0.23, 0.215, 0.185) * mix(0.75, 1.15, cloudNoise(p * 1.1));
+          col = mix(col, scree, gentle * smoothstep(0.3, 0.6, cloudNoise(p * 0.035 + 4.0)));
+          float cliff = smoothstep(0.3, 0.55, vSlope);
+          vec3 cliffC = vec3(0.065, 0.062, 0.058) * (0.7 + 0.6 * cloudNoise(p * 0.12 + vec2(0.0, vWorldY * 0.15)));
+          col = mix(col, cliffC, cliff * 0.85);
+          vec3 rd = detailRatio(${ROCK_ID}, uv); col *= rd * rd; // 岩は濃淡を強めに(ひび・層の手ざわり)
+          float low = 1.0 - smoothstep(${(LAND_BASE + 7).toFixed(1)}, ${(LAND_BASE + 20).toFixed(1)}, vWorldY);
+          col = mix(col, vec3(0.085, 0.11, 0.04) * detailRatio(1, uv), low * gentle * smoothstep(0.3, 0.55, cloudNoise(p * 0.05)));
+          float snowLine = 64.0 + (cloudNoise(p * 0.04) - 0.5) * 8.0;
+          float snow = smoothstep(snowLine, snowLine + 2.5, vWorldY) * (1.0 - smoothstep(0.42, 0.62, vSlope));
+          col = mix(col, vec3(0.78, 0.8, 0.84) * mix(0.9, 1.05, cloudNoise(p * 0.3)), snow);
+          return col;
+        }
+        // 麦畑: マスごとに決めた向きの短冊を4〜6枚。短冊ごと(一部は途中で区切る)に麦の色を変え、
+        // 間に草のあぜ道、短冊の向きに畝の筋とトラクターの轍(2本1組の線)を引き、風で明るさがそよぐ。
+        vec3 fieldColor(vec2 p, vec2 c, vec4 info, vec2 uv) {
+          vec2 dir = vec2(cos(info.z), sin(info.z)), nrm = vec2(-dir.y, dir.x);
+          vec2 q = p - c; float u = dot(q, dir), v = dot(q, nrm);
+          const float W = 23.0;
+          float sv = v / W + info.w, si = floor(sv), fv = fract(sv);
+          float cut = (h21(vec2(si, info.w * 13.0)) - 0.5) * 80.0;
+          float ui = u > cut ? 1.0 : 0.0;
+          float fid = h21(vec2(si * 1.7 + ui * 9.3, info.w * 31.0 + 2.0));
+          vec3 col;
+          if (fid < 0.32) col = vec3(0.50, 0.34, 0.10);       // 熟した麦の金色
+          else if (fid < 0.56) col = vec3(0.56, 0.41, 0.15);  // 明るい麦わら色
+          else if (fid < 0.76) col = vec3(0.40, 0.24, 0.07);  // 黄土色
+          else if (fid < 0.9) col = vec3(0.30, 0.29, 0.10);   // まだ青みの残る麦
+          else col = vec3(0.20, 0.13, 0.065);                  // 刈り取って耕した畑
+          float plough = step(0.9, fid);
+          col *= mix(0.88, 1.08, fbm2(p * 0.045 + fid * 40.0));
+          float tram = abs(fract(v / 8.0 + fid * 3.0) - 0.5) * 8.0;
+          col *= 1.0 - 0.38 * aaLine(abs(tram - 0.5), 0.2) * (1.0 - plough);
+          col *= 1.0 + sin(v * 6.2832 / 1.3) * mix(0.07, 0.18, plough) * aaFade(v, 1.3);
+          col *= 1.0 + sin(uTime * 1.3 + dot(p, vec2(0.05, 0.035))) * 0.03 * (1.0 - plough);
+          col *= mix(vec3(1.0), detailRatio(2, uv), 0.3);
+          float lane = min(min(fv, 1.0 - fv) * W, abs(u - cut));
+          col = mix(col, vec3(0.11, 0.135, 0.045) * detailRatio(1, uv), 1.0 - smoothstep(0.7, 1.4, lane));
+          return col;
+        }
+        // 丘(赤茶の粘土の採掘場): 同心円の段(地形の高さと同じ式)。段の面は粘土の色を段ごとに変え、
+        // 段の切り立った面は明るい橙に地層の縞、段の付け根に陰。外周の掘っていない縁は草と低木。
+        vec3 hillsColor(vec2 p, vec2 c, vec4 info, vec2 uv) {
+          vec2 q = p - c; float a = atan(q.y, q.x);
+          float r = length(q) + sin(a * 2.0 + info.w * 6.2832) * 4.5 + sin(a * 3.0 + info.w * 12.0) * 3.0 + sin(a * 7.0 + info.w * 20.0) * 1.2;
+          float rf = clamp(r / ${(SCALE * 0.62).toFixed(2)}, 0.0, 1.0) * 3.4;
+          float ring = floor(rf), fr = fract(rf);
+          vec3 col = ring < 0.5 ? vec3(0.40, 0.17, 0.065) : (mod(ring, 2.0) < 0.5 ? vec3(0.34, 0.125, 0.045) : vec3(0.42, 0.18, 0.06));
+          col *= mix(0.85, 1.1, fbm2(p * 0.06 + 3.0));
+          col *= 1.0 + sin(r * 2.4) * 0.05 * aaFade(r, 2.6); // 重機の走った跡(段に沿う筋)
+          vec3 face = vec3(0.52, 0.25, 0.095) * (0.82 + 0.18 * sin(vWorldY * 5.0));
+          col = mix(col, face, (1.0 - smoothstep(0.0, 0.09, fr)) * step(0.5, ring) * step(ring, 3.0));
+          col *= 1.0 - 0.32 * smoothstep(0.86, 1.0, fr) * step(ring, 2.5);
+          float rim = smoothstep(3.3, 3.4, rf);
+          vec3 scrub = mix(vec3(0.12, 0.13, 0.05), vec3(0.30, 0.16, 0.08), smoothstep(0.35, 0.7, fbm2(p * 0.07)));
+          col = mix(col, scrub * detailRatio(1, uv), rim);
+          col *= detailRatio(3, uv);
+          col = mix(col, face, smoothstep(${SLOPE_LO.toFixed(2)}, ${SLOPE_HI.toFixed(2)}, vSlope) * 0.6 * (1.0 - rim));
+          return col;
+        }
+        // 砂漠: 明るい砂色。大きな砂丘の陰影は地形の起伏、細かな風紋と乾いた礫の斑はここで描く
+        vec3 desertColor(vec2 p, vec2 uv) {
+          vec3 col = mix(vec3(0.46, 0.29, 0.115), vec3(0.55, 0.37, 0.155), fbm2(p * 0.015));
+          float rx = p.x * 0.921 - p.y * 0.389 + sin(p.y * 0.05) * 6.0 + sin(p.x * 0.031) * 4.0;
+          col *= 1.0 + sin(rx * 6.2832 / 2.2) * 0.07 * aaFade(rx, 2.2);
+          col *= 1.0 + sin(rx * 6.2832 / 8.0 + cloudNoise(p * 0.03) * 4.0) * 0.08;
+          float grav = smoothstep(0.6, 0.72, fbm2(p * 0.028 + 5.0));
+          col = mix(col, vec3(0.20, 0.155, 0.10) * (0.8 + 0.4 * cloudNoise(p * 1.5)), grav * 0.65);
+          col *= mix(vec3(1.0), detailRatio(${SAND_ID}, uv), 0.6);
+          return col;
+        }
+        vec3 terrainColor(int hi, vec2 uv, vec2 p) {
+          vec4 info = uHexInfo[hi]; vec2 c = uHexXZ[hi];
+          int id = int(info.x + 0.5);
+          float macro = fbm2(p * 0.018), macro2 = cloudNoise(p * 0.06 + 11.0);
+          vec3 col;
+          if (id == 0) col = vec3(0.055, 0.075, 0.03) * detailRatio(1, uv) * mix(0.8, 1.2, macro); // 林床と林縁の草(林冠の下は陰で暗くなる)
+          else if (id == 1) { // 牧草地: 青々とした所と少し乾いた所の斑
+            col = mix(vec3(0.10, 0.17, 0.048), vec3(0.19, 0.21, 0.075), smoothstep(0.35, 0.8, macro));
+            col *= mix(0.86, 1.1, macro2) * detailRatio(1, uv);
+            // 放牧の区画ごとの違い(刈った所・伸びた所)。マスの向きにそろえた大きな四角の斑
+            vec2 dq = p - c; vec2 pr = vec2(dot(dq, vec2(cos(info.z), sin(info.z))), dot(dq, vec2(-sin(info.z), cos(info.z))));
+            float pad = h21(floor(pr / 34.0) + info.w * 17.0);
+            col *= mix(vec3(0.9, 0.92, 0.95), vec3(1.12, 1.08, 0.92), pad);
+          }
+          else if (id == 2) col = fieldColor(p, c, info, uv);
+          else if (id == 3) return hillsColor(p, c, info, uv);
+          else if (id == ${ROCK_ID}) return rockColor(p, uv);
+          else return desertColor(p, uv);
+          return mix(col, rockColor(p, uv), smoothstep(${SLOPE_LO.toFixed(2)}, ${SLOPE_HI.toFixed(2)}, vSlope));
+        }
+        // 最寄り2マス(添字)・色のブレンド具合・2マスの境目(垂直二等分線)までの距離を毎ピクセル求める
+        void nearestTwoHex(vec2 p, out int i1, out int i2, out float mixT, out float dB) {
+          float d1 = 1e9, d2 = 1e9; i1 = 0; i2 = 0;
           for (int i = 0; i < ${MAX_LAND_HEXES}; i++) {
             if (i >= uHexN) break;
             float dd = distance(p, uHexXZ[i]);
-            if (dd < d1) { d2 = d1; i2 = i1; d1 = dd; i1 = uHexTid[i]; }
-            else if (dd < d2) { d2 = dd; i2 = uHexTid[i]; }
+            if (dd < d1) { d2 = d1; i2 = i1; d1 = dd; i1 = i; }
+            else if (dd < d2) { d2 = dd; i2 = i; }
           }
-          id1 = i1; id2 = i2;
-          mixT = smoothstep(-${HEX_BLEND.toFixed(1)}, ${HEX_BLEND.toFixed(1)}, d2 - d1);
+          mixT = smoothstep(-${HEX_BLEND_COLOR.toFixed(1)}, ${HEX_BLEND_COLOR.toFixed(1)}, d2 - d1);
+          dB = (d2 * d2 - d1 * d1) / (2.0 * max(distance(uHexXZ[i1], uHexXZ[i2]), 1.0));
         }`)
       .replace('#include <map_fragment>', `
         {
           vec2 uv = vTerrainUv;
-          float hId1, hId2, hMixT;
-          nearestTwoHex(vWorldXZ, hId1, hId2, hMixT);
-          vec4 base = mix(sampleTerrainTex(int(hId2 + 0.5), uv, vWorldXZ), sampleTerrainTex(int(hId1 + 0.5), uv, vWorldXZ), hMixT);
-          base = mix(base, sampleTerrainTex(${SAND_ID}, uv, vWorldXZ), vCoastW);
-          float slopeW = smoothstep(${SLOPE_LO.toFixed(2)}, ${SLOPE_HI.toFixed(2)}, vSlope);
-          base = mix(base, sampleTerrainTex(${ROCK_ID}, uv, vWorldXZ), slopeW);
-          #ifdef DECODE_VIDEO_TEXTURE
-            base = sRGBTransferEOTF(base);
-          #endif
-          base.rgb *= cloudShadow(vWorldXZ, uTime);
-          diffuseColor *= base;
+          int i1, i2; float hMixT, dB;
+          nearestTwoHex(vWorldXZ, i1, i2, hMixT, dB);
+          bool w1 = uHexInfo[i1].y > 0.5, w2 = uHexInfo[i2].y > 0.5;
+          if (w1 && !w2) { i1 = i2; hMixT = 1.0; } // 海のマスの側は、隣の陸の色を伸ばす(渚の色は下で砂に寄せる)
+          vec3 col = terrainColor(i1, uv, vWorldXZ);
+          if (hMixT < 0.999 && !w2) col = mix(terrainColor(i2, uv, vWorldXZ), col, hMixT);
+          // 陸どうしの境目に沿う細い陰(生け垣・石垣の根もとの暗がり)。区画の形が遠目にも読めるように
+          if (!w1 && !w2) col *= 1.0 - 0.28 * (1.0 - smoothstep(0.6, 2.2, dB));
+          vec3 beach = mix(vec3(0.40, 0.32, 0.19), vec3(0.33, 0.26, 0.155), cloudNoise(vWorldXZ * 0.05)) * detailRatio(${SAND_ID}, uv);
+          col = mix(col, beach, pow(vCoastW, 2.2) * (1.0 - smoothstep(0.2, 0.45, vSlope))); // 崖の海岸は砂にしない(岩肌のまま)
+          col *= cloudShadow(vWorldXZ, uTime);
+          diffuseColor.rgb *= col;
         }`);
   };
   return mat;
@@ -914,6 +1051,7 @@ function buildTerrainMesh(g, field) {
   for (let k = 0; k < count; k++) slope[k] = clampUnit(1 - normalAttr.getY(k));
   geo.attributes.slope.needsUpdate = true;
 
+  terrainGrid = { minX, minZ, cell, nx, nz, pos }; // groundY()が描いた面そのものの高さを引けるように
   const mesh = new THREE.Mesh(geo, [getLandMaterial(), getSeabedMaterial()]);
   mesh.receiveShadow = true;
   mesh.castShadow = true;
@@ -1044,7 +1182,9 @@ function updateLandHexUniforms(field) {
   const n = Math.min(field.hexes.length, MAX_LAND_HEXES);
   for (let i = 0; i < n; i++) {
     landUniforms.uHexXZ.value[i].set(field.centers[i].cx, field.centers[i].cz);
-    landUniforms.uHexTid.value[i] = terrainIdOf(field.hexes[i].terrain);
+    const sd = field.seed[i];
+    landUniforms.uHexInfo.value[i].set(terrainIdOf(field.hexes[i].terrain), field.isWater[i] ? 1 : 0,
+      ((sd * 7) % 1000) / 1000 * Math.PI, hexSeedW(sd)); // 地形id, 水か, 麦畑の短冊の向き, 種(丘の段の揺らぎ)
   }
   landUniforms.uHexN.value = n;
 }
@@ -1057,7 +1197,21 @@ function baseYOfHex(hex) {
 }
 function firstHexAt(g, ids) { return ids.map((id) => g.hexes[id]).find(Boolean); }
 // 小物を置く実際の地面の高さ(地形メッシュと同じうねりに乗せる)。terrainFieldがまだなければマス中心の高さで代える。
-function groundY(x, z, fallback) { return terrainField ? sampleTerrain(terrainField, x, z).height : fallback; }
+// 細かい小物(石垣・農道・羊)が面に埋もれたり浮いたりしないよう、計算上の高さではなく、実際に描いている
+// 三角形(buildTerrainMeshの格子。対角線はb-c)の上の高さを返す。格子の外は計算上の高さ。
+function groundY(x, z, fallback) {
+  const G = terrainGrid;
+  if (G) {
+    const gx = (x - G.minX) / G.cell, gz = (z - G.minZ) / G.cell;
+    const i = Math.floor(gx), j = Math.floor(gz);
+    if (i >= 0 && j >= 0 && i < G.nx - 1 && j < G.nz - 1) {
+      const fx = gx - i, fz = gz - j, hAt = (ii, jj) => G.pos[((jj * G.nx) + ii) * 3 + 1];
+      const ha = hAt(i, j), hb = hAt(i + 1, j), hc = hAt(i, j + 1), hd = hAt(i + 1, j + 1);
+      return fx + fz <= 1 ? ha + (hb - ha) * fx + (hc - ha) * fz : hd + (hc - hd) * (1 - fx) + (hb - hd) * (1 - fz);
+    }
+  }
+  return terrainField ? sampleTerrain(terrainField, x, z).height : fallback;
+}
 
 // ================================================================
 // 本体: 盤を1枚まるごと作り直す(地形と海は形が変わったときだけ)
@@ -1073,152 +1227,17 @@ export function renderBoard3D(game, uiState, overlay) {
 
   frameCamera(g);
 
-  const conTrunkItems = [], conCanopyItems = [], broadTrunkItems = [], broadCanopyItems = [],
-    sheepBodyItems = [], sheepHeadItems = [], fencePostItems = [], pastureRockItems = [],
-    wheatItems = [], brickItems = [],
-    snowItems = [], screeItems = [],
-    duneItems = [], dryGrassItems = [], desertRockItems = [], nuggetItems = [];
-  // マス中心(数字チップ)・頂点(置ける場所)の周りは空ける(どの地形の散布もこの半径より内側には置かない)
-  const CLEAR_R = 18;
+  // 植生と小物(木・羊・石垣・窯など、数千〜数万個)は盤の形(と霧の晴れ具合)が変わったときだけ作り直す。
+  // 毎回作り直すと、1本ごとに地形の高さを引くぶん再描画が重くなるため。
+  const vSig = sig + '|' + g.hexes.map((h) => (h.fog ? 1 : 0)).join('');
+  if (vSig !== vegSignature) { vegSignature = vSig; rebuildVegetation(g); }
 
   g.hexes.forEach((hex) => {
     const [cx, cz] = hexCenterOf(g, hex);
     const height = baseYOfHex(hex);
     const R = SCALE * 0.6;
-    // 同じマスは再描画のたびに木・岩の並びが変わらないよう、hex.idを種にした専用の乱数を使う
-    const rr = hexRng(hex.id * 7919 + 13);
     const terrain = hex.fog ? 'fog' : hex.terrain;
-    if (terrain === 'forest') {
-      // 針葉樹(密生)と広葉樹が混ざった森。じっくり乱数で散らすと木の間に地面が覗く大きな隙間ができて
-      // 「数字のまわりの黒い粒の輪」に見えていたので、格子状(+ジッター)に敷き詰めて隙間なく覆う。
-      // 空けるのは中心の石碑まわりと、頂点(建物)・辺(道)の近くだけ。
-      const vxs = hex.vertexIds.map((id) => { const v = g.vertices[id]; return [v.x * SCALE - cx, v.y * SCALE - cz]; });
-      const step = 6.6 / Math.sqrt(DENSITY); // 木1本あたりの敷き詰め間隔(canopy半径の倍くらい。高画質ほど詰める)
-      let i = 0;
-      for (let gx = -R; gx <= R; gx += step) {
-        for (let gz = -R; gz <= R; gz += step) {
-          const dist = Math.hypot(gx, gz);
-          if (dist < CLEAR_R || dist > R * 0.97) continue;
-          if (vxs.some(([vx, vz]) => Math.hypot(gx - vx, gz - vz) < 11)) continue; // 頂点(建物)の近くは空ける
-          const x = cx + gx + rr(-step * 0.42, step * 0.42), z = cz + gz + rr(-step * 0.42, step * 0.42);
-          const y = groundY(x, z, height), s = rr(0.8, 1.35);
-          const seed = hex.id * 9973 + (i++);
-          if (rr(0, 1) < 0.62) {
-            conTrunkItems.push({ x, y: y + 1.7 * s, z, s, ry: rr(0, Math.PI * 2), seed });
-            conCanopyItems.push({ x, y: y + 5.9 * s, z, s, ry: rr(0, Math.PI * 2), seed: seed + 1 });
-          } else {
-            broadTrunkItems.push({ x, y: y + 1.1 * s, z, s, ry: rr(0, Math.PI * 2), seed });
-            broadCanopyItems.push({ x, y: y + 3.8 * s, z, s, ry: rr(0, Math.PI * 2), seed: seed + 1 });
-          }
-        }
-      }
-    } else if (terrain === 'pasture') {
-      // 起伏のある草地+羊の群れ(かたまりで数頭ずつ)+木の柵+ところどころ石
-      const clusters = Math.round(rr(2, 3) * Math.max(1, DENSITY * 0.6));
-      for (let c = 0; c < clusters; c++) {
-        const ca = rr(0, Math.PI * 2), cr = rr(CLEAR_R, R * 0.6);
-        const ccx = cx + Math.cos(ca) * cr, ccz = cz + Math.sin(ca) * cr;
-        const flock = Math.round(rr(5, 9) * DENSITY);
-        for (let i = 0; i < flock; i++) {
-          const x = ccx + rr(-9, 9), z = ccz + rr(-9, 9);
-          if (Math.hypot(x - cx, z - cz) < CLEAR_R) continue;
-          const y = groundY(x, z, height), s = rr(0.8, 1.05), ry = rr(0, Math.PI * 2);
-          const seed = hex.id * 6151 + c * 100 + i;
-          sheepBodyItems.push({ x, y: y + 0.55 * s, z, s, ry, seed });
-          sheepHeadItems.push({ x: x + Math.cos(ry) * 0.6 * s, y: y + 0.55 * s, z: z + Math.sin(ry) * 0.6 * s, s, ry, seed: seed + 1 });
-        }
-      }
-      addFence(cx, cz, height, R, hex.id);
-      const rocks = Math.round(rr(1, 3) * DENSITY);
-      for (let i = 0; i < rocks; i++) {
-        const a = rr(0, Math.PI * 2), r = rr(CLEAR_R, R * 0.85);
-        const x = cx + Math.cos(a) * r, z = cz + Math.sin(a) * r;
-        pastureRockItems.push({ x, y: groundY(x, z, height), z, s: rr(0.8, 1.4), ry: rr(0, 6), seed: hex.id * 311 + i });
-      }
-    } else if (terrain === 'field') {
-      // 短冊形の畑を4〜6枚、同じ耕作方向にそろえて並べる(畝・色違い・そよぎは地面シェーダ側で)。
-      // マスごとに向きを1つだけ決め、それに直角な向きへ帯(短冊)を等間隔にずらして並べる
-      // (以前は短冊ごとに向きがバラバラで、1枚の畑に見えなかった)。
-      const ang = rr(0, Math.PI);
-      const nx = Math.cos(ang), nz = Math.sin(ang);
-      const strips = Math.round(rr(4, 6));
-      const half = R * 0.92;
-      let i = 0;
-      for (let s2 = 0; s2 < strips; s2++) {
-        const off = (s2 - (strips - 1) / 2) * (half * 2 / strips) * 0.86; // 短冊どうしの間にあぜ道ぶんの隙間
-        const rows = Math.round(rr(8, 11) * DENSITY);
-        for (let row = 0; row < rows; row++) {
-          const t = (row / (rows - 1) - 0.5) * half * 1.3;
-          const x = cx + nx * t + -nz * off + rr(-1.5, 1.5), z = cz + nz * t + nx * off + rr(-1.5, 1.5);
-          const d = Math.hypot(x - cx, z - cz);
-          if (d > R * 0.95 || d < CLEAR_R) continue;
-          wheatItems.push({ x, y: groundY(x, z, height) + 1.2, z, ry: ang + rr(-0.08, 0.08), s: rr(0.8, 1.1), seed: hex.id * 97 + i++ });
-        }
-      }
-    } else if (terrain === 'hills') {
-      // 赤茶の粘土の採掘場: 段々の掘削跡(地形の高さ側で表現)+レンガの山+窯と煙
-      const piles = Math.round(rr(2, 3) * Math.max(1, DENSITY * 0.7));
-      for (let p = 0; p < piles; p++) {
-        const a = rr(0, Math.PI * 2), r = rr(CLEAR_R, R * 0.65);
-        const pcx = cx + Math.cos(a) * r, pcz = cz + Math.sin(a) * r, py = groundY(pcx, pcz, height);
-        const rows = 3;
-        for (let row = 0; row < rows; row++) {
-          const perRow = 4 - row;
-          for (let k = 0; k < perRow; k++) {
-            const bx = pcx + (k - (perRow - 1) / 2) * 1.3, bz = pcz + rr(-0.3, 0.3);
-            brickItems.push({ x: bx, y: py + 0.3 + row * 0.62, z: bz, ry: rr(-0.1, 0.1), seed: hex.id * 71 + p * 10 + row * 4 + k });
-          }
-        }
-      }
-      addKiln(cx + rr(-R * 0.3, R * 0.3), cz + rr(-R * 0.3, R * 0.3), height, rr);
-      const rocks = Math.round(rr(2, 4) * DENSITY);
-      for (let i = 0; i < rocks; i++) {
-        const a = rr(0, Math.PI * 2), r = rr(CLEAR_R, R * 0.9);
-        const x = cx + Math.cos(a) * r, z = cz + Math.sin(a) * r;
-        screeItems.push({ x, y: groundY(x, z, height), z, s: rr(0.7, 1.3), ry: rr(0, 6), seed: hex.id * 211 + i });
-      }
-    } else if (terrain === 'mountains') {
-      // 高い岩山(尾根・崖・頂は地形メッシュの高さ側=ridged fbmが作る。小物の円錐は立てない)
-      // +頂の雪だまり+中腹の鉱山入口とトロッコ線路+がれ場
-      [[-0.35, -0.1], [0.3, -0.2], [0, 0.3]].forEach(([dx, dz], i) => {
-        const x = cx + dx * SCALE, z = cz + dz * SCALE, s = rr(0.9, 1.3);
-        // 雪だまりは尾根の実際の高さに直接置く(地形の起伏に貼りつく小さな塊を数個)
-        const patches = Math.round(rr(2, 4) * Math.max(1, DENSITY * 0.5));
-        for (let p = 0; p < patches; p++) {
-          const sx = x + rr(-6, 6), sz = z + rr(-6, 6);
-          const sy = groundY(sx, sz, height);
-          if (sy < height + 18) continue; // 尾根の高いところだけ(低い場所には積もらせない)
-          snowItems.push({ x: sx, y: sy + 0.6, z: sz, s: rr(0.7, 1.15) * s });
-        }
-        const scree = Math.round(rr(8, 14) * DENSITY);
-        for (let k = 0; k < scree; k++) {
-          const a = rr(0, Math.PI * 2), r = rr(5, 13) * s;
-          const rx = x + Math.cos(a) * r, rz = z + Math.sin(a) * r;
-          screeItems.push({ x: rx, y: groundY(rx, rz, height), z: rz, s: rr(0.6, 1.2), ry: rr(0, 6), seed: hex.id * 401 + i * 20 + k });
-        }
-      });
-      addMineAndRail(cx, cz, height, R, rr);
-    } else if (terrain === 'desert') {
-      // 風紋の砂丘(模様は地面シェーダ)+乾いた岩+まばらな枯れ草。サボテンは置かない。
-      duneItems.push({ x: cx - 20, y: groundY(cx - 20, cz + 10, height) + 1, z: cz + 10, s: rr(0.9, 1.2) });
-      duneItems.push({ x: cx + 24, y: groundY(cx + 24, cz - 14, height) + 1, z: cz - 14, s: rr(0.8, 1) });
-      const rocks = Math.round(rr(1, 3) * DENSITY), tufts = Math.round(rr(3, 6) * DENSITY);
-      for (let i = 0; i < rocks; i++) {
-        const a = rr(0, Math.PI * 2), r = rr(CLEAR_R, R * 0.85);
-        const x = cx + Math.cos(a) * r, z = cz + Math.sin(a) * r;
-        desertRockItems.push({ x, y: groundY(x, z, height), z, s: rr(0.7, 1.3), ry: rr(0, 6), seed: hex.id * 131 + i });
-      }
-      for (let i = 0; i < tufts; i++) {
-        const a = rr(0, Math.PI * 2), r = rr(CLEAR_R, R * 0.9);
-        const x = cx + Math.cos(a) * r, z = cz + Math.sin(a) * r;
-        dryGrassItems.push({ x, y: groundY(x, z, height), z, s: rr(0.6, 1.1), ry: rr(0, 6), seed: hex.id * 151 + i });
-      }
-    } else if (terrain === 'gold') {
-      for (let i = 0; i < 5; i++) {
-        const a = (i / 5) * Math.PI * 2 + rr(-0.2, 0.2), r = rr(R * 0.3, R * 0.65);
-        nuggetItems.push({ x: cx + Math.cos(a) * r, y: height + 2.5, z: cz + Math.sin(a) * r, s: rr(0.8, 1.2), ry: rr(0, 6) });
-      }
-    } else if (terrain === 'castle') {
+    if (terrain === 'castle') {
       addCastle(cx, cz, height);
     } else if (terrain === 'pitch') {
       addPitch(cx, cz, height);
@@ -1235,26 +1254,6 @@ export function renderBoard3D(game, uiState, overlay) {
     if (hex.number2 != null) addNumberChip(cx + 24, cz - 16, height, hex.number2, false, 0.6);
   });
 
-  [
-    instancedFrom(GEO.conTrunk, MAT.conBark, conTrunkItems, 0.015),
-    instancedFrom(GEO.conCanopy, MAT.conLeaf, conCanopyItems, 0.04),
-    instancedFrom(GEO.broadTrunk, MAT.broadBark, broadTrunkItems, 0.015),
-    instancedFrom(GEO.broadCanopy, MAT.broadLeaf, broadCanopyItems, 0.05),
-    instancedFrom(GEO.sheepBody, MAT.sheep, sheepBodyItems, 0.015),
-    instancedFrom(GEO.sheepHead, MAT.sheepHead, sheepHeadItems),
-    instancedFrom(GEO.fieldRock, MAT.fieldRock, pastureRockItems, 0.02),
-    instancedFrom(GEO.wheat, MAT.wheat, wheatItems, 0.04),
-    instancedFrom(GEO.brick, MAT.brick, brickItems, 0.03),
-    instancedFrom(GEO.snowPatch, MAT.snow, snowItems, 0.02),
-    instancedFrom(GEO.scree, MAT.scree, screeItems, 0.03),
-    instancedFrom(GEO.dune, MAT.sand, duneItems),
-    instancedFrom(GEO.dryGrass, MAT.dryGrass, dryGrassItems, 0.04),
-    instancedFrom(GEO.desertRock, MAT.desertRock, desertRockItems, 0.03),
-    instancedFrom(GEO.nugget, MAT.gold, nuggetItems),
-  ].forEach((m) => { if (m) sceneGroup.add(m); });
-
-  // マスの境目(六角の辺)に、隣り合う地形に合った縁取りを描く
-  if (terrainField) buildHexBoundaries(g, terrainField);
 
   // 港
   g.portEdgeIds.forEach((eId) => addPort(g, eId));
@@ -1340,6 +1339,7 @@ export function renderBoard3D(game, uiState, overlay) {
 
 function disposeGroup(group) {
   group.traverse((o) => {
+    if (o.isInstancedMesh) o.dispose(); // インスタンスの行列・色のバッファ(ジオメトリは共有なので残す)
     if (o.geometry && !Object.values(GEO).includes(o.geometry)) o.geometry.dispose();
     const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
     mats.forEach((m) => { if (!Object.values(MAT).includes(m) && !Object.values(TERRAIN_MAT).includes(m)) m.dispose(); });
@@ -1447,49 +1447,222 @@ function addPort(g, eId) {
   sceneGroup.add(post, board);
 }
 
-// 牧草地の木の柵: マスの縁の一部(弧)にだけ杭+横木を渡す(全周だと囲いだらけになるので控えめに)
-function addFence(cx, cz, height, R, seedBase) {
-  const rr = hexRng(seedBase * 433 + 1);
-  const start = rr(0, Math.PI * 2), span = rr(1.6, 2.6), radius = R * 0.82;
-  const posts = Math.round(span / 0.28);
-  const items = [];
-  const pts = [];
-  for (let i = 0; i <= posts; i++) {
-    const a = start + (i / posts) * span;
-    const x = cx + Math.cos(a) * radius, z = cz + Math.sin(a) * radius;
-    pts.push({ x, z, y: groundY(x, z, height) });
-    items.push({ x, y: pts[i].y + 0.8, z, s: 1 });
+// ================================================================
+// 植生と小物(③)。縮尺は実物(1単位≒2.5m)。マス全体を地形らしく埋め、空けるのは数字の石碑のまわりの
+// 小さな空き地と、頂点(建物の場所)・辺(道の場所)の細い帯だけ。どれもマスごとに固定の乱数で置く。
+// ================================================================
+// 点(x,z)から六角(pts=角の座標)の辺までの最短距離(内側が正)。森の縁・小物の配置で「区画の内側か」を見る。
+function hexInset(x, z, pts, cx, cz) {
+  let m = Infinity;
+  for (let i = 0; i < pts.length; i++) {
+    const [ax, az] = pts[i], [bx, bz] = pts[(i + 1) % pts.length];
+    let nx = -(bz - az), nz = bx - ax;
+    const len = Math.hypot(nx, nz) || 1; nx /= len; nz /= len;
+    if ((cx - ax) * nx + (cz - az) * nz < 0) { nx = -nx; nz = -nz; }
+    m = Math.min(m, (x - ax) * nx + (z - az) * nz);
   }
-  const postMesh = instancedFrom(GEO.fencePost, MAT.fence, items);
-  if (postMesh) sceneGroup.add(postMesh);
-  for (let i = 0; i < pts.length - 1; i++) {
-    const a = pts[i], b = pts[i + 1];
-    const len = Math.hypot(b.x - a.x, b.z - a.z);
-    [0.55, 1.0].forEach((h) => {
-      const rail = new THREE.Mesh(GEO.fenceRail, MAT.fence);
-      rail.scale.set(len, 1, 1);
-      rail.position.set((a.x + b.x) / 2, (a.y + b.y) / 2 + h, (a.z + b.z) / 2);
-      rail.rotation.y = -Math.atan2(b.z - a.z, b.x - a.x);
-      sceneGroup.add(rail);
-    });
+  return m;
+}
+// 地面の傾き(0=平ら)。山の木の限界などに使う(数か所だけなので差分で求める)
+function groundSlope(x, z, h) {
+  const e = 2;
+  const hx = groundY(x + e, z, h) - groundY(x - e, z, h), hz = groundY(x, z + e, h) - groundY(x, z - e, h);
+  return 1 - 1 / Math.sqrt(1 + (hx * hx + hz * hz) / (4 * e * e));
+}
+// 木を1本ぶん足す(針葉樹か広葉樹)。林冠は地面から生やす(幹は空からはほぼ見えないので作らない)
+function pushTree(V, x, z, y, s, conif, seed) {
+  if (conif) V.con.push({ x, y: y + 2.4 * s, z, s, ry: (seed % 628) / 100, seed });
+  else V.broad.push({ x, y: y + 1.9 * s, z, s, ry: (seed % 628) / 100, seed });
+}
+// 線分(ax,az)-(bx,bz)に沿って、間隔stepで点を返す(区切りごとに地面の高さを取り直すため)
+function alongSeg(ax, az, bx, bz, step) {
+  const len = Math.hypot(bx - ax, bz - az), n = Math.max(1, Math.round(len / step)), out = [];
+  for (let i = 0; i < n; i++) { const t = (i + 0.5) / n; out.push([ax + (bx - ax) * t, az + (bz - az) * t]); }
+  return out;
+}
+const CLEAR_R = 19; // 数字の石碑(半径15)のまわりの空き地
+const VERTEX_CLEAR = 12; // 頂点(開拓地・都市・置ける場所の印)のまわり
+const EDGE_CLEAR = 5.5; // 辺(道・置ける場所の印。幅11)からこれだけ内側までは背の高いものを置かない
+
+function rebuildVegetation(g) {
+  if (vegGroup) { disposeGroup(vegGroup); scene.remove(vegGroup); }
+  vegGroup = new THREE.Group();
+  scene.add(vegGroup);
+  const V = { con: [], broad: [], bush: [], sheep: [], rock: [], brick: [], scree: [], dryGrass: [], desertRock: [], nugget: [], wall: [], path: [], stream: [] };
+  g.hexes.forEach((hex) => {
+    const terrain = hex.fog ? 'fog' : hex.terrain;
+    if (WATER_LIKE.has(terrain)) return;
+    const [cx, cz] = hexCenterOf(g, hex);
+    const height = baseYOfHex(hex);
+    const pts = hexPointsOf(g, hex);
+    const rr = hexRng(hex.id * 7919 + 13);
+    const nearVertex = (x, z, r) => pts.some(([vx, vz]) => Math.hypot(x - vx, z - vz) < r);
+    // マスの内側の、空き地・頂点・辺を避けた点をn個ほど選ぶ(足りなければそこまで)
+    const scatter = (n, minR, inset, fn) => {
+      for (let i = 0, tries = 0; i < n && tries < n * 6; tries++) {
+        const x = cx + rr(-HEX_R, HEX_R), z = cz + rr(-HEX_R, HEX_R);
+        if (hexInset(x, z, pts, cx, cz) < inset || Math.hypot(x - cx, z - cz) < minR || nearVertex(x, z, VERTEX_CLEAR)) continue;
+        fn(x, z, groundY(x, z, height), i++);
+      }
+    };
+    if (terrain === 'forest') {
+      // 区画いっぱいの林冠。格子+ジッターで隙間なく敷き、縁はノイズで少し不規則に。針葉樹と広葉樹は
+      // 大きなノイズで「まとまり」ごとに入れ替わる(実際の混交林のように群れで変わる)。ところどころ小さな林間の空き地。
+      const step = 2.7 / Math.sqrt(FOREST_DENSITY);
+      let i = 0;
+      for (let gx = -HEX_R; gx <= HEX_R; gx += step) {
+        for (let gz = -HEX_R; gz <= HEX_R; gz += step) {
+          const x = cx + gx + rr(-0.45, 0.45) * step, z = cz + gz + rr(-0.45, 0.45) * step;
+          const edgeN = valueNoise2(x * 0.09, z * 0.09, 77) * 2.2 + valueNoise2(x * 0.31, z * 0.31, 78) * 0.9;
+          if (hexInset(x, z, pts, cx, cz) < EDGE_CLEAR + Math.abs(edgeN)) continue; // 置ける辺の印(幅11)より外に木を出さない
+          if (Math.hypot(x - cx, z - cz) < CLEAR_R + valueNoise2(x * 0.15, z * 0.15, 79) * 2.5) continue;
+          if (nearVertex(x, z, VERTEX_CLEAR + edgeN)) continue;
+          if (valueNoise2(x * 0.05, z * 0.05, hex.id + 80) < -0.6) continue;
+          const conif = valueNoise2(x * 0.022, z * 0.022, hex.id + 3) + rr(-0.3, 0.3) > -0.15;
+          const s = rr(0.75, 1.2) * (1 + valueNoise2(x * 0.04, z * 0.04, 81) * 0.2);
+          pushTree(V, x, z, groundY(x, z, height), s, conif, hex.id * 9973 + i++);
+        }
+      }
+    } else if (terrain === 'pasture') {
+      // 起伏のある草地: 羊の群れ(白い点々が固まる)+はぐれた羊、区画の中を仕切る石垣か木の柵、
+      // ぽつんと立つ大きな木と低木の茂み、ところどころの石
+      const flocks = Math.round(rr(3, 5));
+      for (let f = 0; f < flocks; f++) {
+        const a = rr(0, Math.PI * 2), r = rr(CLEAR_R + 6, HEX_A * 0.75);
+        const fx = cx + Math.cos(a) * r, fz = cz + Math.sin(a) * r;
+        const n = Math.round(rr(12, 26) * Math.sqrt(DENSITY));
+        for (let i = 0; i < n; i++) {
+          const x = fx + (rr(-1, 1) + rr(-1, 1)) * 5, z = fz + (rr(-1, 1) + rr(-1, 1)) * 5;
+          if (hexInset(x, z, pts, cx, cz) < 2.5 || Math.hypot(x - cx, z - cz) < CLEAR_R - 2) continue;
+          const y = groundY(x, z, height);
+          V.sheep.push({ x, y: y + 0.3, z, s: rr(0.85, 1.1), ry: rr(0, Math.PI * 2), seed: hex.id * 6151 + f * 100 + i });
+        }
+      }
+      scatter(Math.round(10 * Math.sqrt(DENSITY)), CLEAR_R - 2, 2.5, (x, z, y, i) => V.sheep.push({ x, y: y + 0.3, z, s: rr(0.85, 1.1), ry: rr(0, 6), seed: hex.id * 7 + i }));
+      // 区画を仕切る1〜2本の弦(石垣)。マス中心の空き地・頂点・辺のそばは途切れさせる
+      const walls = Math.round(rr(1, 2.4));
+      for (let w = 0; w < walls; w++) {
+        const a = rr(0, Math.PI), off = rr(CLEAR_R + 4, HEX_A * 0.7) * (rr(0, 1) < 0.5 ? -1 : 1);
+        const dx = Math.cos(a), dz = Math.sin(a), ox = cx - dz * off, oz = cz + dx * off;
+        const fence = rr(0, 1) < 0.35;
+        alongSeg(ox - dx * HEX_R, oz - dz * HEX_R, ox + dx * HEX_R, oz + dz * HEX_R, fence ? 2.2 : 1.05).forEach(([x, z]) => {
+          if (hexInset(x, z, pts, cx, cz) < 3 || nearVertex(x, z, VERTEX_CLEAR)) return;
+          if (fence) addFencePost(V, x, z, groundY(x, z, height), a);
+          else V.wall.push({ x, y: groundY(x, z, height) + 0.25, z, ry: -a, seed: hex.id * 31 + Math.round(x * 7) });
+        });
+      }
+      scatter(Math.round(rr(5, 9)), CLEAR_R + 2, EDGE_CLEAR + 2, (x, z, y, i) => pushTree(V, x, z, y, rr(1.1, 1.5), false, hex.id * 401 + i));
+      scatter(Math.round(rr(6, 12) * Math.sqrt(DENSITY)), CLEAR_R, 3, (x, z, y, i) => V.bush.push({ x, y: y + 0.3, z, s: rr(0.5, 0.9), ry: rr(0, 6), seed: hex.id * 13 + i }));
+      scatter(Math.round(rr(6, 12) * DENSITY), CLEAR_R, 2, (x, z, y, i) => V.rock.push({ x, y: y + 0.1, z, s: rr(0.6, 1.3), ry: rr(0, 6), seed: hex.id * 311 + i }));
+    } else if (terrain === 'field') {
+      // 麦畑の短冊・あぜ道・畝は地面のシェーダ(fieldColor)が描く。ここでは畑の隅に低木を少しだけ
+      scatter(Math.round(rr(3, 6)), CLEAR_R + 4, 2, (x, z, y, i) => V.bush.push({ x, y: y + 0.4, z, s: rr(0.8, 1.3), ry: rr(0, 6), seed: hex.id * 17 + i }));
+    } else if (terrain === 'hills') {
+      // 赤茶の粘土の採掘場: 段々(地形の高さ+シェーダ)、段の上のレンガ置き場(パレットの列)、
+      // 外周の縁に輪窯の建屋と煙突(煙)、縁の低木
+      const yards = 2;
+      for (let y2 = 0; y2 < yards; y2++) {
+        const a = rr(0, Math.PI * 2) + y2 * Math.PI, r = SCALE * 0.62 * (2.5 / 3.4); // 外側から2段目の段の上
+        const px = cx + Math.cos(a) * r, pz = cz + Math.sin(a) * r;
+        const tx = -Math.sin(a), tz = Math.cos(a), nx = Math.cos(a), nz = Math.sin(a);
+        for (let row = 0; row < 3; row++) {
+          for (let col = 0; col < 7; col++) {
+            if (rr(0, 1) < 0.15) continue; // 運び出された跡の空き
+            const ox = (col - 3) * 1.8, oz = (row - 1) * 1.8;
+            const x = px + tx * ox + nx * oz, z = pz + tz * ox + nz * oz;
+            if (hexInset(x, z, pts, cx, cz) < 3) continue;
+            V.brick.push({ x, y: groundY(x, z, height) + 0.5, z, ry: -a, s: rr(0.85, 1.05), seed: hex.id * 71 + y2 * 40 + row * 8 + col });
+          }
+        }
+      }
+      const ka = rr(0, Math.PI * 2), kr = SCALE * 0.66;
+      addKiln(cx + Math.cos(ka) * kr, cz + Math.sin(ka) * kr, height, ka, rr);
+      scatter(Math.round(rr(30, 50) * Math.sqrt(DENSITY)), SCALE * 0.64, 3, (x, z, y, i) => V.bush.push({ x, y: y + 0.35, z, s: rr(0.6, 1.1), ry: rr(0, 6), seed: hex.id * 19 + i }));
+      scatter(Math.round(rr(8, 14) * DENSITY), CLEAR_R, 2, (x, z, y, i) => V.scree.push({ x, y, z, s: rr(0.5, 1.0), ry: rr(0, 6), seed: hex.id * 211 + i }));
+    } else if (terrain === 'mountains') {
+      // 岩山: 岩肌・がれ場・崖・雪は地面のシェーダ(rockColor)。低く緩い裾にだけ針葉樹(森林限界)、
+      // 斜面のところどころに岩、中腹に鉱山の入口とトロッコの線路
+      const step = 3.4 / Math.sqrt(FOREST_DENSITY);
+      let i = 0;
+      for (let gx = -HEX_R; gx <= HEX_R; gx += step) {
+        for (let gz = -HEX_R; gz <= HEX_R; gz += step) {
+          const x = cx + gx + rr(-0.45, 0.45) * step, z = cz + gz + rr(-0.45, 0.45) * step;
+          if (hexInset(x, z, pts, cx, cz) < EDGE_CLEAR + 1 || nearVertex(x, z, VERTEX_CLEAR)) continue;
+          const y = groundY(x, z, height);
+          if (y > LAND_BASE + 13 + valueNoise2(x * 0.06, z * 0.06, 90) * 5) continue;
+          if (valueNoise2(x * 0.07, z * 0.07, hex.id + 91) < -0.1 || groundSlope(x, z, height) > 0.3) continue;
+          pushTree(V, x, z, y, rr(0.7, 1.05), true, hex.id * 3301 + i++);
+        }
+      }
+      scatter(Math.round(rr(25, 45) * DENSITY), CLEAR_R, 2, (x, z, y, k) => V.scree.push({ x, y, z, s: rr(0.5, 1.3), ry: rr(0, 6), seed: hex.id * 401 + k }));
+      addMineAndRail(cx, cz, height, SCALE * 0.6, rr);
+    } else if (terrain === 'desert') {
+      // 風紋の砂丘(地形の起伏+シェーダ)、乾いた岩のかたまり、まばらな枯れ草。サボテンは置かない。
+      const clusters = Math.round(rr(3, 6));
+      for (let c = 0; c < clusters; c++) {
+        const a = rr(0, Math.PI * 2), r = rr(CLEAR_R + 4, HEX_A * 0.8);
+        const ox = cx + Math.cos(a) * r, oz = cz + Math.sin(a) * r;
+        const n = Math.round(rr(3, 9));
+        for (let i = 0; i < n; i++) {
+          const x = ox + rr(-4, 4), z = oz + rr(-4, 4);
+          if (hexInset(x, z, pts, cx, cz) < 2 || nearVertex(x, z, VERTEX_CLEAR)) continue;
+          V.desertRock.push({ x, y: groundY(x, z, height), z, s: rr(0.6, 2.0) * (i === 0 ? 1.4 : 1), ry: rr(0, 6), seed: hex.id * 131 + c * 20 + i });
+        }
+      }
+      scatter(Math.round(rr(140, 220) * Math.sqrt(DENSITY)), CLEAR_R - 2, 1.5, (x, z, y, i) => V.dryGrass.push({ x, y: y + 0.08, z, s: rr(0.6, 1.3), ry: rr(0, 6), seed: hex.id * 151 + i }));
+    } else if (terrain === 'gold') {
+      for (let i = 0; i < 5; i++) {
+        const a = (i / 5) * Math.PI * 2 + rr(-0.2, 0.2), r = rr(SCALE * 0.18, SCALE * 0.4);
+        V.nugget.push({ x: cx + Math.cos(a) * r, y: height + 2.5, z: cz + Math.sin(a) * r, s: rr(0.8, 1.2), ry: rr(0, 6) });
+      }
+    }
+  });
+  buildHexBoundaries(g, V);
+  [
+    instancedFrom(GEO.conCanopy, MAT.conLeaf, V.con, 0.035),
+    instancedFrom(GEO.broadCanopy, MAT.broadLeaf, V.broad, 0.05),
+    instancedFrom(GEO.bush, MAT.bush, V.bush, 0.04),
+    instancedFrom(GEO.sheepBody, MAT.sheep, V.sheep, 0.01),
+    instancedFrom(GEO.fieldRock, MAT.fieldRock, V.rock, 0.02),
+    instancedFrom(GEO.brickStack, MAT.brick, V.brick, 0.02),
+    instancedFrom(GEO.scree, MAT.scree, V.scree, 0.03),
+    instancedFrom(GEO.dryGrass, MAT.dryGrass, V.dryGrass, 0.04),
+    instancedFrom(GEO.desertRock, MAT.desertRock, V.desertRock, 0.03),
+    instancedFrom(GEO.nugget, MAT.gold, V.nugget),
+    instancedFrom(GEO.wallStone, MAT.wallStone, V.wall, 0.02),
+    instancedFrom(GEO.pathTile, MAT.path, V.path, 0.01),
+    instancedFrom(GEO.streamTile, MAT.stream, V.stream),
+  ].forEach((m) => { if (m) vegGroup.add(m); });
+  if (V.fencePosts && V.fencePosts.length) {
+    vegGroup.add(instancedFrom(GEO.fencePost, MAT.fence, V.fencePosts));
+    vegGroup.add(instancedFrom(GEO.fenceRail, MAT.fence, V.fenceRails));
   }
 }
-// 丘の採掘場: 窯(素焼きの筒+屋根)+ゆっくり立ちのぼる煙(静止した煙の塊。揺れはつけない簡略表現)
-function addKiln(cx, cz, height, rr) {
-  const y = groundY(cx, cz, height);
-  const body = new THREE.Mesh(GEO.kilnBody, MAT.kiln);
-  body.position.set(cx, y + 1.8, cz);
-  const roof = new THREE.Mesh(GEO.kilnRoof, MAT.kiln);
-  roof.position.set(cx, y + 4.5, cz);
-  body.castShadow = true; roof.castShadow = true;
-  sceneGroup.add(body, roof);
-  for (let i = 0; i < 3; i++) {
+// 木の柵: 杭1本+横木2本(次の杭まで)。間隔2.2単位
+function addFencePost(V, x, z, y, a) {
+  (V.fencePosts ||= []).push({ x, y: y + 0.55, z, s: 1 });
+  V.fenceRails ||= [];
+  [0.45, 0.85].forEach((h) => V.fenceRails.push({ x, y: y + h, z, ry: -a, s: 2.2 }));
+}
+
+// 丘の採掘場の窯場: 細長い輪窯の建屋+切妻屋根+背の高い煙突、煙突の先から風下へ流れる薄い煙
+function addKiln(x, z, height, ang, rr) {
+  const y = groundY(x, z, height);
+  const ry = -ang + Math.PI / 2; // 建屋の長い辺を段の円周に沿わせる
+  const hall = new THREE.Mesh(GEO.kilnHall, MAT.kiln);
+  hall.position.set(x, y + 1.1, z); hall.rotation.y = ry;
+  const roof = new THREE.Mesh(GEO.kilnRoof, MAT.kilnRoof);
+  roof.position.set(x, y + 2.75, z); roof.rotation.y = ry;
+  const chimney = new THREE.Mesh(GEO.chimney, MAT.kiln);
+  const chx = x + Math.cos(ang) * 3.2, chz = z + Math.sin(ang) * 3.2;
+  chimney.position.set(chx, y + 5, chz);
+  [hall, roof, chimney].forEach((m) => { m.castShadow = true; m.receiveShadow = true; vegGroup.add(m); });
+  for (let i = 0; i < 6; i++) {
     const puff = new THREE.Mesh(GEO.smoke, MAT.smoke.clone());
-    const s = 1.4 + i * 1.1;
-    puff.material.opacity = 0.32 - i * 0.08;
-    puff.scale.setScalar(s);
-    puff.position.set(cx + rr(-1, 1) * i, y + 6 + i * 2.6, cz + rr(-1, 1) * i);
-    sceneGroup.add(puff);
+    puff.material.opacity = 0.34 - i * 0.045;
+    puff.scale.setScalar(0.9 + i * 0.7);
+    puff.position.set(chx + i * 1.6 + rr(-0.4, 0.4), y + 10.5 + i * 1.1, chz - i * 0.9 + rr(-0.4, 0.4));
+    vegGroup.add(puff);
   }
 }
 // 山の中腹: 鉱山の入口(木枠+暗い穴)とそこから延びるトロッコの線路(2本のレール+枕木)
@@ -1499,86 +1672,76 @@ function addMineAndRail(cx, cz, height, R, rr) {
   const ey = groundY(ex, ez, height);
   const facing = a + Math.PI; // 斜面の外側を向く
   const frame = new THREE.Mesh(GEO.mineFrame, MAT.mineFrame);
-  frame.position.set(ex, ey + 2, ez);
+  frame.position.set(ex, ey + 1.2, ez);
   frame.rotation.y = facing;
   const hole = new THREE.Mesh(GEO.mineHole, MAT.mineHole);
-  hole.position.set(ex + Math.cos(facing) * 0.75, ey + 1.8, ez + Math.sin(facing) * 0.75);
+  hole.position.set(ex + Math.cos(facing) * 0.65, ey + 1.0, ez + Math.sin(facing) * 0.65);
   hole.rotation.y = facing;
   frame.castShadow = true;
-  sceneGroup.add(frame, hole);
+  vegGroup.add(frame, hole);
   const dirx = Math.cos(a), dirz = Math.sin(a); // 線路は斜面を下る向き(入口から外へ)
   const railLen = R * 0.5;
-  const tieItems = [];
-  const ties = Math.round(railLen / 2.2);
+  const ties = Math.round(railLen / 1.6);
+  const tieItems = [], railItems = [];
   for (let i = 0; i < ties; i++) {
     const t = (i + 0.5) / ties * railLen;
-    const x = ex + dirx * t, z = ez + dirz * t;
-    tieItems.push({ x, y: groundY(x, z, height) + 0.1, z, ry: a + Math.PI / 2, s: 1 });
+    const x = ex + dirx * t, z = ez + dirz * t, y = groundY(x, z, height);
+    tieItems.push({ x, y: y + 0.1, z, ry: -a + Math.PI / 2, s: 1 });
+    [-0.45, 0.45].forEach((off) => railItems.push({ x: x - dirz * off, y: y + 0.2, z: z + dirx * off, ry: -a, s: 1.6 }));
   }
-  const tieMesh = instancedFrom(GEO.tie, MAT.tie, tieItems);
-  if (tieMesh) sceneGroup.add(tieMesh);
-  [-0.55, 0.55].forEach((off) => {
-    const rail = new THREE.Mesh(GEO.rail, MAT.rail);
-    rail.scale.set(railLen, 1, 1);
-    const ox = -Math.sin(a) * off, oz = Math.cos(a) * off;
-    rail.position.set(ex + dirx * railLen / 2 + ox, groundY(ex + dirx * railLen / 2, ez + dirz * railLen / 2, height) + 0.2, ez + dirz * railLen / 2 + oz);
-    rail.rotation.y = -a;
-    sceneGroup.add(rail);
-  });
+  [instancedFrom(GEO.tie, MAT.tie, tieItems), instancedFrom(GEO.rail, MAT.rail, railItems)].forEach((m) => { if (m) vegGroup.add(m); });
 }
-// マスの境目(六角の辺)を、隣り合う地形の組み合わせに合った縁取りで描く。海に面した辺(渚)は描かない。
-// 頂点のすぐそば(置ける場所の印)は避けるよう、辺の両端から margin ぶん内側だけに描く。
-function buildHexBoundaries(g, field) {
-  const margin = 15;
-  const seen = new Set();
+// マスの境目(陸どうしの辺)を、隣り合う地形の組み合わせに合った縁取りで描く。海に面した辺(渚)は描かない。
+// 生け垣(低木の列。辺の上に背の高い木は置かない)・石垣・土の農道・細い小川。森の縁は林冠そのものが縁なので、
+// 林の外に農道を沿わせる。頂点のすぐそば(建物・置ける場所の印)はVERTEX_CLEARぶん空ける。
+function buildHexBoundaries(g, V) {
   g.edges.forEach((edge) => {
-    if (seen.has(edge.id)) return;
-    seen.add(edge.id);
     const hexes = (edge.hexIds || []).map((id) => g.hexes[id]).filter(Boolean);
     if (hexes.length < 2) return; // 盤の外周(海)は描かない
-    if (hexes.some((h) => WATER_LIKE.has(h.terrain))) return; // 本物の海岸線(渚)は描かない
-    const [ta, tb] = [hexes[0].terrain, hexes[1].terrain];
-    if (ta === tb) return; // 同じ地形どうしは縁取りなし(林冠のつながりに任せる)
-    const pair = [ta, tb].sort().join('|');
-    const style = boundaryStyle(pair, edge.id);
+    if (hexes.some((h) => WATER_LIKE.has(h.terrain) || h.fog)) return; // 本物の海岸線(渚)は描かない
+    const style = boundaryStyle(hexes[0].terrain, hexes[1].terrain, edge.id);
     if (!style) return;
     const v1 = g.vertices[edge.v1], v2 = g.vertices[edge.v2];
     const x1 = v1.x * SCALE, z1 = v1.y * SCALE, x2 = v2.x * SCALE, z2 = v2.y * SCALE;
     const full = Math.hypot(x2 - x1, z2 - z1);
-    if (full <= margin * 2 + 4) return;
     const ux = (x2 - x1) / full, uz = (z2 - z1) / full;
-    const ax = x1 + ux * margin, az = z1 + uz * margin, bx = x2 - ux * margin, bz = z2 - uz * margin;
-    const len = Math.hypot(bx - ax, bz - az);
-    const ang = -Math.atan2(bz - az, bx - ax);
-    const mx = (ax + bx) / 2, mz = (az + bz) / 2;
-    const fallbackY = baseYOfHex(hexes[0]);
-    // 地形は起伏があるので、縁取りは1本の板ではなく短い区切りを並べ、区切りごとに地面の高さを取り直す
-    // (1枚の長い板にすると、途中でうねりに埋まって点線のように欠けて見えてしまう)。
-    const yOffset = style === 'stream' ? 0.3 : (style === 'path' ? 0.1 : 0.5);
-    const geo = style === 'wall' ? GEO.wallStone : style === 'hedge' ? GEO.hedge : style === 'stream' ? GEO.streamTile : GEO.pathTile;
-    const mat = style === 'wall' ? MAT.wallStone : style === 'hedge' ? MAT.hedge : style === 'stream' ? MAT.stream : MAT.path;
-    const n = Math.max(2, Math.round(len / 1.3));
-    const items = [];
-    for (let i = 0; i < n; i++) {
-      const t = (i + 0.5) / n;
-      const x = ax + (bx - ax) * t, z = az + (bz - az) * t;
-      items.push({ x, y: groundY(x, z, fallbackY) + yOffset, z, ry: ang, s: 1 });
+    const m = VERTEX_CLEAR - 2;
+    const ax = x1 + ux * m, az = z1 + uz * m, bx = x2 - ux * m, bz = z2 - uz * m;
+    const ang = Math.atan2(uz, ux);
+    const fy = baseYOfHex(hexes[0]);
+    const rr = hexRng(edge.id * 613 + 1);
+    if (style === 'hedge') {
+      alongSeg(ax, az, bx, bz, 0.95).forEach(([x, z], i) => {
+        const y = groundY(x, z, fy);
+        V.bush.push({ x, y: y + 0.45, z, s: rr(0.8, 1.25), ry: rr(0, 6), seed: edge.id * 97 + i });
+      });
+    } else if (style === 'wall') {
+      alongSeg(ax, az, bx, bz, 1.05).forEach(([x, z], i) => V.wall.push({ x, y: groundY(x, z, fy) + 0.3, z, ry: -ang, seed: edge.id * 53 + i }));
+    } else if (style === 'path') {
+      alongSeg(ax, az, bx, bz, 1.1).forEach(([x, z]) => V.path.push({ x, y: groundY(x, z, fy) + 0.06, z, ry: -ang }));
+    } else if (style === 'stream') {
+      alongSeg(ax, az, bx, bz, 1.1).forEach(([x, z], i) => {
+        const w = Math.sin(i * 0.5 + edge.id) * 0.5; // わずかに蛇行
+        const sx = x - uz * w, sz = z + ux * w;
+        V.stream.push({ x: sx, y: groundY(sx, sz, fy) + 0.12, z: sz, ry: -ang });
+        if (rr(0, 1) < 0.3) { const side = rr(0, 1) < 0.5 ? -1.6 : 1.6; V.bush.push({ x: sx - uz * side, y: groundY(sx, sz, fy) + 0.4, z: sz + ux * side, s: rr(0.7, 1.2), ry: rr(0, 6), seed: edge.id * 7 + i }); }
+      });
     }
-    const variance = (style === 'path' || style === 'stream') ? 0 : 0.015;
-    const mesh = instancedFrom(geo, mat, items, variance);
-    if (mesh) sceneGroup.add(mesh);
   });
 }
-// 地形の組み合わせごとの縁取りの種類。辺id(ハッシュ)で一部を小川・あぜ道に振り分け、単調にしない。
-function boundaryStyle(pair, edgeId) {
+// 地形の組み合わせごとの縁取りの種類。辺idで一部を振り分けて単調にしない。nullは描かない。
+function boundaryStyle(ta, tb, edgeId) {
   const h = hexRng(edgeId * 997 + 3)(0, 1);
-  if (pair === 'forest|pasture' || pair === 'forest|field') return h < 0.5 ? 'hedge' : 'wall';
-  if (pair === 'pasture|field') return h < 0.35 ? 'stream' : (h < 0.7 ? 'hedge' : 'path');
-  if (pair === 'field|hills' || pair === 'hills|mountains' || pair === 'field|mountains') return 'wall';
-  if (pair === 'forest|hills' || pair === 'forest|mountains') return 'wall';
-  if (pair === 'pasture|hills') return h < 0.5 ? 'wall' : 'path';
-  if (pair.includes('desert')) return h < 0.4 ? 'path' : null;
-  return h < 0.5 ? 'path' : 'hedge';
+  const has = (t) => ta === t || tb === t;
+  if (ta === 'mountains' && tb === 'mountains') return null; // 尾根続き
+  if (has('forest')) return has('mountains') ? null : 'path'; // 林の縁に沿う農道
+  if (has('mountains')) return 'wall'; // 山裾の石垣
+  if (has('desert')) return h < 0.5 ? 'wall' : 'path';
+  if (ta === 'pasture' && tb === 'pasture') return 'wall';
+  if (has('pasture') && has('field')) return h < 0.3 ? 'stream' : 'hedge';
+  if (ta === 'field' && tb === 'field') return h < 0.5 ? 'hedge' : 'path';
+  if (has('hills')) return h < 0.5 ? 'hedge' : 'wall';
+  return 'hedge';
 }
 
 function addCastle(cx, cz, height) {
