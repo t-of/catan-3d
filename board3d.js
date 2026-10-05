@@ -59,6 +59,7 @@ const GEO = {
   dune: new THREE.ConeGeometry(14, 5, 10),
   cactusBody: new THREE.CylinderGeometry(2.2, 2.6, 16, 7),
   nugget: new THREE.OctahedronGeometry(3.4, 0),
+  road: new THREE.CylinderGeometry(3.4, 3.4, 1, 7), // 角を落とした木の棒(断面が七角形の丸太)。長さはmeshのscale.yで伸ばす
 };
 const MAT = {
   bark: new THREE.MeshStandardMaterial({ color: 0x5b3a22, flatShading: true, roughness: 0.95 }),
@@ -252,8 +253,11 @@ function instancedFrom(geo, mat, items, variance) {
     q.setFromEuler(e);
     m4.compose(new THREE.Vector3(it.x, it.y, it.z), q, new THREE.Vector3(it.s ?? 1, it.s ?? 1, it.s ?? 1));
     mesh.setMatrixAt(i, m4);
-    if (variance) mesh.setColorAt(i, new THREE.Color().setHSL(
-      hsl.h + rand(-variance, variance), clampUnit(hsl.s + rand(-0.06, 0.06)), clampUnit(hsl.l + rand(-0.1, 0.1))));
+    if (variance) {
+      const r = it.seed != null ? hexRng(it.seed) : rand;
+      mesh.setColorAt(i, new THREE.Color().setHSL(
+        hsl.h + r(-variance, variance), clampUnit(hsl.s + r(-0.06, 0.06)), clampUnit(hsl.l + r(-0.1, 0.1))));
+    }
   });
   mesh.castShadow = true; mesh.receiveShadow = true;
   mesh.instanceMatrix.needsUpdate = true;
@@ -261,6 +265,20 @@ function instancedFrom(geo, mat, items, variance) {
   return mesh;
 }
 function rand(a, b) { return a + Math.random() * (b - a); }
+// マスごとに固定の乱数(同じマスは再描画のたびに木・岩の並びが変わらない)。種はhex.id。
+function mulberry32(seed) {
+  let s = seed >>> 0;
+  return () => {
+    s = (s + 0x6D2B79F5) >>> 0;
+    let t = Math.imul(s ^ (s >>> 15), 1 | s);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function hexRng(seed) {
+  const next = mulberry32(seed);
+  return (a, b) => a + next() * (b - a);
+}
 
 // 地形ごとの手続き的な模様(ノイズの染み)を描いたテクスチャ。地形ごとに1枚だけ作って使い回す
 const terrainTexCache = new Map();
@@ -410,48 +428,52 @@ export function renderBoard3D(game, uiState, overlay) {
       waterMeshes.push(tile);
     }
     const R = SCALE * 0.6;
+    // 同じマスは再描画のたびに木・岩の並びが変わらないよう、hex.idを種にした専用の乱数を使う
+    const rr = hexRng(hex.id * 7919 + 13);
     if (terrain === 'forest') {
-      const n = Math.floor(rand(4, 6));
+      const n = Math.floor(rr(4, 6));
       for (let i = 0; i < n; i++) {
-        const a = rand(0, Math.PI * 2), r = rand(0, R * 0.8);
-        const x = cx + Math.cos(a) * r, z = cz + Math.sin(a) * r, s = rand(0.8, 1.2);
-        treeItems.push({ x, y: height + 4.5 * s, z, s });
-        canopyItems.push({ x, y: height + 13 * s, z, s });
+        const a = rr(0, Math.PI * 2), r = rr(0, R * 0.8);
+        const x = cx + Math.cos(a) * r, z = cz + Math.sin(a) * r, s = rr(0.8, 1.2);
+        const seed = hex.id * 97 + i;
+        treeItems.push({ x, y: height + 4.5 * s, z, s, ry: rr(0, Math.PI * 2), seed });
+        canopyItems.push({ x, y: height + 13 * s, z, s, ry: rr(0, Math.PI * 2), seed: seed + 1 });
       }
     } else if (terrain === 'pasture') {
-      const n = Math.floor(rand(2, 4));
+      const n = Math.floor(rr(2, 4));
       for (let i = 0; i < n; i++) {
-        const a = rand(0, Math.PI * 2), r = rand(0, R * 0.7);
-        sheepItems.push({ x: cx + Math.cos(a) * r, y: height + 4, z: cz + Math.sin(a) * r, s: rand(0.8, 1.1) });
+        const a = rr(0, Math.PI * 2), r = rr(0, R * 0.7);
+        sheepItems.push({ x: cx + Math.cos(a) * r, y: height + 4, z: cz + Math.sin(a) * r, s: rr(0.8, 1.1), seed: hex.id * 97 + i });
       }
     } else if (terrain === 'field') {
+      let i = 0;
       for (let row = -2; row <= 2; row++) {
         for (let col = -1; col <= 1; col++) {
-          const x = cx + col * 22 + rand(-3, 3), z = cz + row * 16 + rand(-3, 3);
+          const x = cx + col * 22 + rr(-3, 3), z = cz + row * 16 + rr(-3, 3);
           if (Math.hypot(x - cx, z - cz) > R * 0.85) continue;
-          wheatItems.push({ x, y: height + 4.5, z, ry: rand(0, Math.PI * 2), s: rand(0.8, 1.1) });
+          wheatItems.push({ x, y: height + 4.5, z, ry: rr(0, Math.PI * 2), s: rr(0.8, 1.1), seed: hex.id * 97 + i++ });
         }
       }
     } else if (terrain === 'hills') {
-      const n = Math.floor(rand(2, 3));
+      const n = Math.floor(rr(2, 3));
       for (let i = 0; i < n; i++) {
-        const a = rand(0, Math.PI * 2), r = rand(0, R * 0.6);
-        moundItems.push({ x: cx + Math.cos(a) * r, y: height + 1, z: cz + Math.sin(a) * r, s: rand(0.9, 1.3), rx: 0, ry: rand(0, 6) });
+        const a = rr(0, Math.PI * 2), r = rr(0, R * 0.6);
+        moundItems.push({ x: cx + Math.cos(a) * r, y: height + 1, z: cz + Math.sin(a) * r, s: rr(0.9, 1.3), rx: 0, ry: rr(0, 6), seed: hex.id * 97 + i });
       }
     } else if (terrain === 'mountains') {
-      [[-0.35, -0.1], [0.3, -0.2], [0, 0.3]].forEach(([dx, dz]) => {
-        const x = cx + dx * SCALE, z = cz + dz * SCALE, s = rand(0.9, 1.3);
-        peakItems.push({ x, y: height + 10 * s, z, s });
-        if (Math.random() < 0.7) snowItems.push({ x, y: height + 19 * s, z, s });
+      [[-0.35, -0.1], [0.3, -0.2], [0, 0.3]].forEach(([dx, dz], i) => {
+        const x = cx + dx * SCALE, z = cz + dz * SCALE, s = rr(0.9, 1.3);
+        peakItems.push({ x, y: height + 10 * s, z, s, ry: rr(0, Math.PI * 2), seed: hex.id * 97 + i });
+        if (rr(0, 1) < 0.7) snowItems.push({ x, y: height + 19 * s, z, s });
       });
     } else if (terrain === 'desert') {
-      duneItems.push({ x: cx - 20, y: height + 1, z: cz + 10, s: rand(0.9, 1.2) });
-      duneItems.push({ x: cx + 24, y: height + 1, z: cz - 14, s: rand(0.8, 1) });
-      if (Math.random() < 0.6) cactusItems.push({ x: cx + rand(-30, 30), y: height + 8, z: cz + rand(-20, 20), s: rand(0.8, 1) });
+      duneItems.push({ x: cx - 20, y: height + 1, z: cz + 10, s: rr(0.9, 1.2) });
+      duneItems.push({ x: cx + 24, y: height + 1, z: cz - 14, s: rr(0.8, 1) });
+      if (rr(0, 1) < 0.6) cactusItems.push({ x: cx + rr(-30, 30), y: height + 8, z: cz + rr(-20, 20), s: rr(0.8, 1) });
     } else if (terrain === 'gold') {
       for (let i = 0; i < 5; i++) {
-        const a = (i / 5) * Math.PI * 2 + rand(-0.2, 0.2), r = rand(R * 0.3, R * 0.65);
-        nuggetItems.push({ x: cx + Math.cos(a) * r, y: height + 2.5, z: cz + Math.sin(a) * r, s: rand(0.8, 1.2), ry: rand(0, 6) });
+        const a = (i / 5) * Math.PI * 2 + rr(-0.2, 0.2), r = rr(R * 0.3, R * 0.65);
+        nuggetItems.push({ x: cx + Math.cos(a) * r, y: height + 2.5, z: cz + Math.sin(a) * r, s: rr(0.8, 1.2), ry: rr(0, 6) });
       }
     } else if (terrain === 'castle') {
       addCastle(cx, cz, height);
@@ -472,7 +494,7 @@ export function renderBoard3D(game, uiState, overlay) {
   if (g.lakeNumbers) { /* 漁師の湖は lake terrain 側で既に扱う簡略版（4隅の出目は省略） */ }
 
   [
-    instancedFrom(GEO.trunk, MAT.bark, treeItems),
+    instancedFrom(GEO.trunk, MAT.bark, treeItems, 0.02),
     instancedFrom(GEO.canopy, MAT.leaf, canopyItems, 0.03),
     instancedFrom(GEO.sheep, MAT.sheep, sheepItems, 0.02),
     instancedFrom(GEO.wheat, MAT.wheat, wheatItems, 0.03),
@@ -514,9 +536,13 @@ export function renderBoard3D(game, uiState, overlay) {
     } else if (edge.road != null) {
       const color = new THREE.Color(game.players[edge.road].color);
       const len = Math.hypot(x2 - x1, z2 - z1) * 0.82;
-      const road = new THREE.Mesh(new THREE.BoxGeometry(len, 4, 7), new THREE.MeshStandardMaterial({ color, flatShading: true }));
-      road.position.set(mx, baseY + 2, mz);
-      road.rotation.y = ang;
+      // 角を落とした木の棒(断面が七角形の丸太)。GEO.roadは長さ1なので、scale.yで伸ばしてから横向きに倒す
+      const road = new THREE.Mesh(GEO.road, new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.85 }));
+      road.scale.set(1, len, 1);
+      const qLay = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2);
+      const qTurn = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), ang);
+      road.quaternion.multiplyQuaternions(qTurn, qLay);
+      road.position.set(mx, baseY + 3.4, mz);
       road.castShadow = true;
       sceneGroup.add(road);
     }
@@ -658,23 +684,39 @@ function addShip(mx, mz, ang, playerColor) {
   sceneGroup.add(hull, sail);
 }
 
+// 家: 土台(石)・壁・軒(屋根の張り出し)・屋根の4段。軒は壁より少し広い板を45度回し、角を庇のように張り出す
 function addHouse(x, baseY, z, color) {
-  const body = new THREE.Mesh(new THREE.BoxGeometry(11, 9, 11), new THREE.MeshStandardMaterial({ color, flatShading: true }));
-  body.position.set(x, baseY + 4.5 + 1.5, z);
-  const roof = new THREE.Mesh(new THREE.ConeGeometry(9, 8, 4), new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.75), flatShading: true }));
+  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), flatShading: true, roughness: 0.95 });
+  const wallMat = new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.8 });
+  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), flatShading: true, roughness: 0.75 });
+  const plinth = new THREE.Mesh(new THREE.BoxGeometry(12.5, 2, 12.5), stoneMat);
+  plinth.position.set(x, baseY + 1 + 1.5, z);
+  const body = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 11), wallMat);
+  body.position.set(x, baseY + 2 + 4 + 1.5, z);
+  const eave = new THREE.Mesh(new THREE.BoxGeometry(13, 1.2, 13), roofMat);
+  eave.rotation.y = Math.PI / 4;
+  eave.position.set(x, baseY + 2 + 8 + 0.6 + 1.5, z);
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(9, 7, 4), roofMat);
   roof.rotation.y = Math.PI / 4;
-  roof.position.set(x, baseY + 9 + 4 + 1.5, z);
-  body.castShadow = true; roof.castShadow = true;
-  sceneGroup.add(body, roof);
+  roof.position.set(x, baseY + 2 + 8 + 1.2 + 3.5 + 1.5, z);
+  [plinth, body, eave, roof].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
 }
+// 都市: 土台・基部・塔・塔の軒・屋根。基部と塔はどちらも面取り代わりに軒(張り出し)を挟む
 function addCity(x, baseY, z, color) {
-  const base = new THREE.Mesh(new THREE.BoxGeometry(17, 10, 17), new THREE.MeshStandardMaterial({ color, flatShading: true }));
-  base.position.set(x, baseY + 5 + 1.5, z);
-  const tower = new THREE.Mesh(new THREE.CylinderGeometry(6, 6, 18, 8), new THREE.MeshStandardMaterial({ color, flatShading: true }));
-  tower.position.set(x, baseY + 10 + 9 + 1.5, z);
-  const roof = new THREE.Mesh(new THREE.ConeGeometry(7, 9, 8), new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.75), flatShading: true }));
-  roof.position.set(x, baseY + 10 + 18 + 4.5 + 1.5, z);
-  [base, tower, roof].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
+  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), flatShading: true, roughness: 0.95 });
+  const wallMat = new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.8 });
+  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), flatShading: true, roughness: 0.75 });
+  const plinth = new THREE.Mesh(new THREE.BoxGeometry(18.5, 2, 18.5), stoneMat);
+  plinth.position.set(x, baseY + 1 + 1.5, z);
+  const base = new THREE.Mesh(new THREE.BoxGeometry(17, 9, 17), wallMat);
+  base.position.set(x, baseY + 2 + 4.5 + 1.5, z);
+  const tower = new THREE.Mesh(new THREE.CylinderGeometry(6, 6.6, 17, 8), wallMat);
+  tower.position.set(x, baseY + 2 + 9 + 8.5 + 1.5, z);
+  const towerEave = new THREE.Mesh(new THREE.CylinderGeometry(8, 8, 1.4, 8), roofMat);
+  towerEave.position.set(x, baseY + 2 + 9 + 17 + 0.7 + 1.5, z);
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(7, 9, 8), roofMat);
+  roof.position.set(x, baseY + 2 + 9 + 17 + 1.4 + 4.5 + 1.5, z);
+  [plinth, base, tower, towerEave, roof].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
 }
 function addKnight(x, baseY, z, color, active) {
   const c = new THREE.Color(color);
@@ -685,12 +727,19 @@ function addKnight(x, baseY, z, color, active) {
   head.position.set(x, baseY + 11 + 1.5, z);
   sceneGroup.add(body, head);
 }
+// 盗賊: マント(裾広がりの円錐)・肩の襟巻き(トーラス)・頭・とがり帽子のつば
 function addRobber(cx, height, cz, blink) {
-  const body = new THREE.Mesh(new THREE.ConeGeometry(9, 22, 8), new THREE.MeshStandardMaterial({ color: 0x1c1b22, flatShading: true }));
+  const cloakMat = new THREE.MeshStandardMaterial({ color: 0x1c1b22, flatShading: true, roughness: 0.9 });
+  const body = new THREE.Mesh(new THREE.ConeGeometry(9, 22, 8), cloakMat);
   body.position.set(cx, height + 11, cz);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(6, 8, 6), new THREE.MeshStandardMaterial({ color: 0x2d2c36, flatShading: true }));
+  const collar = new THREE.Mesh(new THREE.TorusGeometry(5, 1.6, 6, 10), cloakMat);
+  collar.rotation.x = Math.PI / 2;
+  collar.position.set(cx, height + 20, cz);
+  const head = new THREE.Mesh(new THREE.SphereGeometry(6, 8, 6), new THREE.MeshStandardMaterial({ color: 0x2d2c36, flatShading: true, roughness: 0.85 }));
   head.position.set(cx, height + 25, cz);
-  sceneGroup.add(body, head);
+  const brim = new THREE.Mesh(new THREE.ConeGeometry(7, 3, 8), cloakMat);
+  brim.position.set(cx, height + 29, cz);
+  sceneGroup.add(body, collar, head, brim);
   if (blink) addPulseRing(cx, height + 1, cz, 20, 0xffd84a);
 }
 function addPirate(cx, height, cz, blink) {
