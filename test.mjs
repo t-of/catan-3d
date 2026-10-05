@@ -1342,6 +1342,14 @@ test('交易と略奪・蛮族の襲撃: CPUだけで4人、数局きちんと�
   }
 });
 
+// 回帰: 種1642だと、開拓地・都市を建てた直後の勝利判定が「蛮族の上陸」での征服(得点が減る)より先に走り、
+// 征服で自分の得点が下がったのに勝者のままになっていた(buildSettlement/buildCity の順序バグ)
+test('交易と略奪・蛮族の襲撃: 種1642で決着しても勝者の得点は勝利点以上のまま(回帰)', () => {
+  const g = withSeededRandom(1642, () => playOutCpu(['weak', 'normal', 'strong', 'normal'], 800000, { expansions: ['traders-barbarians'], scenario: 'barbarians' }));
+  assert.ok(g.winner != null);
+  assert.ok(E.playerScore(g, g.winner) >= g.winTarget);
+});
+
 // ---- 交易と略奪の5〜6人用拡張 ----
 test('交易と略奪×5〜6人: 本島30マス、銀行24枚、特別建設フェイズつき(全シナリオ)', () => {
   for (const n of [5, 6]) {
@@ -1683,7 +1691,8 @@ test('online.js: canStart は5〜6人でも成り立つ。ONLINE_EXPANSIONSは�
 // どちらもcurrentPlayer(game)だけを見て動くので、既存のONLINE_TURN_ACTIONS（9-2で船を足した時点）の
 // 確かめがそのまま効く。霧のマスを見つける処理(revealFogAt)が船の操作に相乗りしていることも確かめる
 test('探検家と海賊: buildShipはcurrentPlayerにしか当たらず、船を置くと霧のマスが開ける（手番の確かめはホスト側の責任）', () => {
-  const g = E.createGame(4, Math.random, { expansions: ['explorers-pirates'] });
+  // 盤の配置によっては霧のマスに隣接する海の辺が見つからないことがある（既存の無関係なゆらぎ）ので種を固定する
+  const g = withSeededRandom(1, () => E.createGame(4, Math.random, { expansions: ['explorers-pirates'] }));
   g.phase = 'main'; g.turn = 1; g.turnNumber = 1;
   g.players.forEach((p) => { p.resources = { wood: 1, brick: 1, sheep: 1, wheat: 0, ore: 0 }; });
   assert.equal(E.currentPlayer(g), 1);

@@ -1361,9 +1361,10 @@ export function buildSettlement(game, vertexId) {
   queueCamelBuild(game);
   fire(game, 'build');
   recalcLongestRoad(game); // 相手の道を分断することがある
+  // 蛮族の襲撃: 上陸で建物が征服され得点が減ることがあるので、勝利判定より先に解決する
+  if (game.scenario === 'barbarians') resolveBarbarianLanding(game, idx);
   // サッカー熱: この手番の終わりに試合が入り、順位の勝利点が動くことがあるので、判定は手番の終わりに回す（公式の「手番の終わりに判定」どおり）
   if (game.soccer && !game.soccerSeasonOver) game.pendingSoccerMatch = true; else checkWin(game, idx);
-  if (game.scenario === 'barbarians') resolveBarbarianLanding(game, idx);
   return true;
 }
 export function buildCity(game, vertexId) {
@@ -1382,8 +1383,9 @@ export function buildCity(game, vertexId) {
   grantSoccerShot(game, idx, vertexId);
   queueCamelBuild(game);
   fire(game, 'build');
-  if (game.soccer && !game.soccerSeasonOver) game.pendingSoccerMatch = true; else checkWin(game, idx);
+  // 蛮族の襲撃: 上陸で建物が征服され得点が減ることがあるので、勝利判定より先に解決する
   if (game.scenario === 'barbarians') resolveBarbarianLanding(game, idx);
+  if (game.soccer && !game.soccerSeasonOver) game.pendingSoccerMatch = true; else checkWin(game, idx);
   return true;
 }
 
