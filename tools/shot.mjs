@@ -64,7 +64,7 @@ export function buildFixedGame() {
   game.phase = 'main';
   game.turn = 0;
   game.turnNumber = 5;
-  game.diceLast = 8;
+  game.diceLast = [4, 4]; // engine.jsの形([d1, d2])に合わせる(数のままだと「サイコロ undefined+undefined=NaN」になる)
   // 盗賊を砂漠以外のどこかへ(陸のマスで、今の位置と違うもの)
   const desertId = game.board.robberHex;
   const other = game.board.hexes.find((h) => h.terrain !== 'desert' && h.terrain !== 'water' && h.id !== desertId);
