@@ -12,7 +12,7 @@
 // PREFIX 'catan-' の前方一致に引っかかり(''catan-3d-v1'.startsWith('catan-')===true)、
 // catan 側の activate が catan-3d のキャッシュまで消してしまう。それを避けるための名前。
 const PREFIX = 'catan3d-';
-const VERSION = 'v8';
+const VERSION = 'v9';
 const CACHE = `${PREFIX}${VERSION}`;
 const FONT_CACHE = `${PREFIX}fonts`;
 
@@ -40,11 +40,9 @@ const SHELL = [
   './vendor/postprocessing/GTAOPass.js',
   './vendor/postprocessing/UnrealBloomPass.js',
   './vendor/postprocessing/LUTPass.js',
-  './vendor/postprocessing/SMAAPass.js',
   './vendor/postprocessing/OutputPass.js',
   './vendor/shaders/CopyShader.js',
   './vendor/shaders/LuminosityHighPassShader.js',
-  './vendor/shaders/SMAAShader.js',
   './vendor/shaders/GTAOShader.js',
   './vendor/shaders/PoissonDenoiseShader.js',
   './vendor/shaders/OutputShader.js',
