@@ -26,12 +26,24 @@ const SCALE = 66; // main.jsのSCALEと同じ値（頂点のx,yをこの倍率�
 const PREFERS_REDUCED = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 // 「動き オフ」ボタン(main.js)はhtmlにmotion-offクラスを付ける。風の揺れ・波・雲の影もそれに合わせて止める。
 function motionOff() { return PREFERS_REDUCED || document.documentElement.classList.contains('motion-off'); }
-const QUALITY = (() => { try { return new URLSearchParams(location.search).get('q') === 'high' ? 'high' : 'mid'; } catch { return 'mid'; } })();
-// ponytail: 品質はこの定数だけで決める。⑤でUIのトグルを足すときはここを書き換える処理を足すだけでよい。
+// 画質: ?q=high/mid があれば常にそれを使う(撮影・比較用に優先)。無ければ保存した設定、それも無ければ既定mid。
+// ponytail: 画質の変更は再読み込みで反映(地形の格子・shadowMapなどinitBoard3Dで一度しか作らないものが多いため)。
+function readSavedQuality() {
+  try { const v = localStorage.getItem('catan-3d.quality'); return (v === 'high' || v === 'mid') ? v : null; } catch { return null; }
+}
+const QUALITY = (() => {
+  try { const q = new URLSearchParams(location.search).get('q'); if (q === 'high' || q === 'mid') return q; } catch { /* noop */ }
+  return readSavedQuality() || 'mid';
+})();
 const Q = {
   mid: { cell: 4, maxGrid: 240, shadowMap: 2048, gtaoSamples: 10, bloom: false, dprCap: 2 },
   high: { cell: 2.6, maxGrid: 400, shadowMap: 4096, gtaoSamples: 16, bloom: true, dprCap: 2.5 }, // 盤全体で512x512以上(ブリーフの要求)
 }[QUALITY];
+// 持ち主色の淡い輪郭線を常に出すか(既定はオフ=選んでいる/動かしている/ホバー中だけ)。保存した設定を読む。
+function readOutlineAlways() {
+  try { return localStorage.getItem('catan-3d.outlineAlways') === '1'; } catch { return false; }
+}
+let outlineAlways = readOutlineAlways();
 // 太陽の向き(午後の低い角度)。方位はカメラが見やすい斜め後ろから、高度25-35°
 const SUN_AZIMUTH = Math.PI * 0.9; // ③: 正面からの順光だと起伏がのっぺり見えたので、左からの斜光(影が右へ伸びる)にした
 const SUN_ELEVATION = Math.PI / 180 * 29;
@@ -76,6 +88,11 @@ let hexHeight = new Map(); // hex.id -> マス中心の高さ(小物を置く基
 let onTapCb = null;
 let hitTargets = []; // [{ mesh, kind, id }]（レイキャストで拾う的）
 let pulseMeshes = []; // 明滅させる的（置ける場所・盗賊など）
+let numberLabels = []; // 数字チップの遠景ラベル(スプライト)。カメラ距離でopacityを毎フレーム更新する
+// 持ち主色の淡い輪郭線(道・開拓地・都市)。毎回の renderBoard3D で作り直すが、ホバー中のキーだけは
+// 作り直しをまたいで覚えておく(マウスが止まっていても描き直しのたびに消えないように)。
+let outlineHoverTargets = []; // [{ hitMesh, visualMesh, alwaysOn, key }]
+let hoveredOutlineKey = null;
 let framedForHexCount = null;
 let hasDebugCam = false; // ?camが指定されていたら、frameCamera()でカメラ位置を奪い返さない
 let oceanUniforms = null;
@@ -154,8 +171,9 @@ const GEO = {
   houseRoofTile: new THREE.ConeGeometry(3.0, 2.2, 4, 1).rotateY(Math.PI / 4).translate(0, 0.5 + 2.5 + 0.26 + 1.1, 0), // 瓦
   houseRoofThatch: lumpy(new THREE.ConeGeometry(3.15, 2.0, 4, 1), 0.07, 11).rotateY(Math.PI / 4).translate(0, 0.5 + 2.5 + 0.26 + 1.0, 0), // 茅葺き
   houseChimney: new THREE.CylinderGeometry(0.17, 0.22, 1.5, 6).translate(1.1, 0.5 + 2.5 + 2.0, 1.1),
-  flagPole: new THREE.CylinderGeometry(0.14, 0.2, 10.6, 6).translate(0, 5.3, 0),
-  flagCloth: new THREE.BoxGeometry(4.4, 2.6, 0.07, 5, 3).translate(2.3, 9.1, 0), // 分割を入れて風シェーダでしなるように
+  // ⑤の直し: 既定のカメラでも点として指させるよう、旗をもう一段大きく・高く(ポールごと)した
+  flagPole: new THREE.CylinderGeometry(0.16, 0.22, 12.4, 6).translate(0, 6.2, 0),
+  flagCloth: new THREE.BoxGeometry(5.6, 3.3, 0.08, 5, 3).translate(2.9, 10.8, 0), // 分割を入れて風シェーダでしなるように
   cityWallRing: new THREE.CylinderGeometry(15.6, 16.8, 9.5, 10, 1, true),
   cityCrenel: new THREE.BoxGeometry(1.15, 1.3, 1.15),
   cityTower: new THREE.CylinderGeometry(3.7, 4.1, 16, 8),
@@ -168,7 +186,7 @@ const GEO = {
   roadTile: new THREE.BoxGeometry(12.5, 0.2, 2.6), // 石畳/土の路面(xが道幅、zが道なりの長さ)。幅は見やすさ優先で実物よりだいぶ広い
   roadRut: new THREE.BoxGeometry(0.6, 0.05, 2.4), // 轍
   roadPost: new THREE.CylinderGeometry(0.19, 0.27, 5.6, 6).translate(0, 2.8, 0), // 道沿いの標柱(旗のポールより低いが地面からよく見える高さ)
-  roadBanner: new THREE.BoxGeometry(2.7, 1.75, 0.06, 5, 3, 1).translate(1.45, 4.5, 0), // 標柱の布(旗と同じ仕組みでなびく)
+  roadBanner: new THREE.BoxGeometry(3.3, 2.1, 0.07, 5, 3, 1).translate(1.75, 4.7, 0), // 標柱の布(旗と同じ仕組みでなびく)。⑤でもう一回り大きく
   shipHull: hullGeometry(16, 4.6, 6.4), // 航海者の船(辺に置く)。舳先がとがった船体
   knightRobe: new THREE.CylinderGeometry(0.85, 1.15, 2.2, 7), // 持ち主の色の外套。上面が平らで、見下ろすカメラでも色がよく見える
   knightHead: new THREE.SphereGeometry(0.68, 7, 5),
@@ -313,8 +331,9 @@ applyFlagSway(MAT.cloth, 1.2);
 function clothColor(colorHex) {
   const hsl = {};
   new THREE.Color(colorHex).getHSL(hsl);
-  // ④の直し: 既定のカメラでも誰の色か分かるよう、以前より少しだけ鮮やかに・明るめに許す(蛍光色にはしない)
-  return new THREE.Color().setHSL(hsl.h, Math.min(hsl.s, 0.68), Math.min(Math.max(hsl.l, 0.33), 0.58));
+  // ⑤の直し: 既定のカメラでもまだ誰の色か指し示しにくかったので、もう一段だけ鮮やかに・明るめに許す
+  // (本物の染め布の範囲にとどめ、蛍光色にはしない)
+  return new THREE.Color().setHSL(hsl.h, Math.min(hsl.s, 0.8), Math.min(Math.max(hsl.l, 0.34), 0.62));
 }
 // instancedでない単体の駒(騎士・船)用に、色ごとの布材質をMATに登録して使い回す(dispose対象から外すため)。
 function clothMaterial(colorHex) {
@@ -467,6 +486,7 @@ export function initBoard3D(container, onTap) {
   buildComposer(container);
 
   attachInput(renderer.domElement);
+  buildSettingsUI(container);
   new ResizeObserver(() => resize(container)).observe(container);
   resize(container);
   applyDebugCamera(); // ?camのデバッグ用カメラ固定(なければ何もしない)
@@ -527,6 +547,77 @@ function updateSunForBoard(maxR) {
   sun.shadow.camera.updateProjectionMatrix();
 }
 
+// ⑤: #board3d の隅に出す小さな設定ボタン。「輪郭線を常に表示」と「画質 中・高」を選べる。
+// index.html/style.cssの色(var(--panel)など)に合わせ、タップがcanvas側(盤の回転・ピック)へ
+// 抜けないようpointerdownで止める。保存はlocalStorage(catan-3d.outlineAlways/quality)。
+function buildSettingsUI(container) {
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'position:absolute;right:10px;bottom:10px;z-index:5;font-family:var(--sans,sans-serif);';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.setAttribute('aria-label', '盤の表示設定を開く');
+  btn.setAttribute('aria-expanded', 'false');
+  btn.textContent = '⚙︎';
+  btn.style.cssText = 'width:38px;height:38px;border-radius:10px;cursor:pointer;'
+    + 'border:1px solid var(--btn-edge,rgba(239,231,214,.14));background:var(--btn-bg,#1c2e3c);'
+    + 'color:var(--fg,#efe7d6);font-size:18px;line-height:1;';
+
+  const panel = document.createElement('div');
+  panel.hidden = true;
+  panel.style.cssText = 'position:absolute;right:0;bottom:46px;width:224px;padding:12px;border-radius:12px;'
+    + 'background:var(--panel,#15232f);border:1px solid var(--panel-edge,rgba(239,231,214,.08));'
+    + 'color:var(--fg,#efe7d6);font-size:13px;display:flex;flex-direction:column;gap:10px;'
+    + 'box-shadow:0 6px 18px rgba(0,0,0,.35);';
+
+  const outlineLabel = document.createElement('label');
+  outlineLabel.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;';
+  const outlineCheck = document.createElement('input');
+  outlineCheck.type = 'checkbox';
+  outlineCheck.checked = outlineAlways;
+  outlineCheck.setAttribute('aria-label', '道・建物の輪郭線をいつも表示する');
+  const outlineText = document.createElement('span');
+  outlineText.textContent = '輪郭線をいつも表示';
+  outlineLabel.append(outlineCheck, outlineText);
+  outlineCheck.addEventListener('change', () => {
+    outlineAlways = outlineCheck.checked;
+    try { localStorage.setItem('catan-3d.outlineAlways', outlineAlways ? '1' : '0'); } catch { /* noop */ }
+    // 今出ている的にもすぐ反映する(次の描き直しを待たない)
+    outlineHoverTargets.forEach((o) => { o.alwaysOn = outlineAlways; o.visualMesh.visible = outlineAlways || o.key === hoveredOutlineKey; });
+  });
+
+  const qualityRow = document.createElement('div');
+  qualityRow.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
+  const qualityLabelText = document.createElement('span');
+  qualityLabelText.textContent = '画質';
+  const qualitySelect = document.createElement('select');
+  qualitySelect.setAttribute('aria-label', '画質(中・高)');
+  qualitySelect.style.cssText = 'background:var(--btn-bg,#1c2e3c);color:var(--fg,#efe7d6);'
+    + 'border:1px solid var(--btn-edge,rgba(239,231,214,.14));border-radius:8px;padding:4px 6px;';
+  [['mid', '中'], ['high', '高']].forEach(([v, label]) => {
+    const opt = document.createElement('option');
+    opt.value = v; opt.textContent = label;
+    if (v === QUALITY) opt.selected = true;
+    qualitySelect.appendChild(opt);
+  });
+  const qualityNote = document.createElement('div');
+  qualityNote.style.cssText = 'font-size:11px;color:var(--muted,#9fb0bd);min-height:14px;';
+  qualitySelect.addEventListener('change', () => {
+    try { localStorage.setItem('catan-3d.quality', qualitySelect.value); } catch { /* noop */ }
+    qualityNote.textContent = qualitySelect.value === QUALITY ? '' : '次の読み込みから使う';
+  });
+  qualityRow.append(qualityLabelText, qualitySelect, qualityNote);
+
+  panel.append(outlineLabel, qualityRow);
+  [btn, panel].forEach((el) => el.addEventListener('pointerdown', (e) => e.stopPropagation()));
+  btn.addEventListener('click', () => {
+    panel.hidden = !panel.hidden;
+    btn.setAttribute('aria-expanded', String(!panel.hidden));
+  });
+  wrap.addEventListener('keydown', (e) => { if (e.key === 'Escape' && !panel.hidden) { panel.hidden = true; btn.setAttribute('aria-expanded', 'false'); btn.focus(); } });
+  wrap.append(btn, panel);
+  container.appendChild(wrap);
+}
+
 // 比較用スクリーンショットのための一時的なデバッグ口。
 // ?cam=x,y,z,tx,ty,tz を付けたときだけカメラを固定する(なければ何もしない)。本番の操作には使わない。
 function applyDebugCamera() {
@@ -558,6 +649,28 @@ function attachInput(dom) {
     pick(dom, e.clientX, e.clientY);
   });
   dom.addEventListener('pointercancel', () => { down = null; });
+  // ⑤: 持ち主色の淡い輪郭線をホバー中だけ見せる(タップ可否には関わらない、見た目だけの的)
+  dom.addEventListener('pointermove', (e) => hoverOutline(dom, e.clientX, e.clientY));
+  dom.addEventListener('pointerleave', () => setHoveredOutline(null));
+}
+
+function hoverOutline(dom, cx, cy) {
+  const r = dom.getBoundingClientRect();
+  pointer.x = ((cx - r.left) / r.width) * 2 - 1;
+  pointer.y = -((cy - r.top) / r.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const meshes = outlineHoverTargets.map((o) => o.hitMesh);
+  const hits = raycaster.intersectObjects(meshes, false);
+  const found = hits.length && outlineHoverTargets.find((o) => o.hitMesh === hits[0].object);
+  setHoveredOutline(found ? found.key : null);
+}
+function setHoveredOutline(key) {
+  if (key === hoveredOutlineKey) return;
+  const prev = outlineHoverTargets.find((o) => o.key === hoveredOutlineKey);
+  if (prev) prev.visualMesh.visible = prev.alwaysOn;
+  hoveredOutlineKey = key;
+  const cur = outlineHoverTargets.find((o) => o.key === key);
+  if (cur) cur.visualMesh.visible = true;
 }
 
 function pick(dom, cx, cy) {
@@ -599,6 +712,12 @@ function animate() {
     if (m.material.emissiveIntensity != null) m.material.emissiveIntensity = 0.4 + k * 1.1;
     if (m.userData.baseScale) { const s = m.userData.baseScale * (1 + k * 0.08); m.scale.setScalar(s); }
   });
+  // 数字チップの遠景ラベル: カメラが近いときは石碑そのものが読めるので出さず(今より読みにくくしない)、
+  // 遠いときだけなめらかに浮かび上がらせる
+  numberLabels.forEach((sprite) => {
+    const d = camera.position.distanceTo(sprite.position);
+    sprite.material.opacity = smoothstep(260, 520, d);
+  });
   controls.update();
   if (composer) composer.render(); else renderer.render(scene, camera);
 }
@@ -620,6 +739,25 @@ function flatHexGeometry(pts, y) {
   for (let i = 0; i < n; i++) {
     const a = pts[i], b = pts[(i + 1) % n];
     pos.push(cx, y, cz, a[0], y, a[1], b[0], y, b[1]);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.computeVertexNormals();
+  return geo;
+}
+// 六角形の細い輪(外周pts〜中心へinnerScaleだけ縮めた内周の帯)。地面に沿った光る線・淡い輪郭線に使う
+// (flatHexGeometryの「塗りつぶした六角形」と違い、中を塗らないので風景を壊さない)
+function hexRingGeometry(pts, y, innerScale) {
+  const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length;
+  const cz = pts.reduce((a, p) => a + p[1], 0) / pts.length;
+  const pos = [];
+  const n = pts.length;
+  for (let i = 0; i < n; i++) {
+    const a = pts[i], b = pts[(i + 1) % n];
+    const ai = [cx + (a[0] - cx) * innerScale, cz + (a[1] - cz) * innerScale];
+    const bi = [cx + (b[0] - cx) * innerScale, cz + (b[1] - cz) * innerScale];
+    pos.push(a[0], y, a[1], b[0], y, b[1], bi[0], y, bi[1]);
+    pos.push(a[0], y, a[1], bi[0], y, bi[1], ai[0], y, ai[1]);
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
@@ -1095,7 +1233,9 @@ function getLandMaterial() { if (!landMaterial) landMaterial = buildLandMaterial
 let cityStoneMaterial = null;
 function getCityStoneMaterial() { if (!cityStoneMaterial) cityStoneMaterial = buildCityStoneMaterial(); return cityStoneMaterial; }
 
-// 数字チップの文字を書いた円いテクスチャ（出目ごとにキャッシュ）
+// 数字チップ(⑤): マス中心に埋め込んだ石碑の上面に彫った数字、のテクスチャ。
+// 彫り跡は「影を少し下にずらして描いてから、本体を描く」だけの簡易な凹みの出し方(本物のバンプは張らない)。
+// 出目ごとにキャッシュ。
 const numberTexCache = new Map();
 function numberTexture(n, hot) {
   const key = `${n}:${hot}`;
@@ -1103,19 +1243,57 @@ function numberTexture(n, hot) {
   const c = document.createElement('canvas');
   c.width = c.height = 128;
   const ctx = c.getContext('2d');
-  ctx.fillStyle = '#f3e7c4'; ctx.beginPath(); ctx.arc(64, 64, 60, 0, Math.PI * 2); ctx.fill();
-  ctx.strokeStyle = '#8a7a52'; ctx.lineWidth = 4; ctx.stroke();
-  ctx.fillStyle = hot ? '#b8321f' : '#2a211b';
-  ctx.font = 'bold 64px Georgia, serif';
+  // 石の面(風化した花崗岩ふう)。ざらつきはわずかなノイズの斑点で足す
+  ctx.fillStyle = '#a89d8a'; ctx.beginPath(); ctx.arc(64, 64, 62, 0, Math.PI * 2); ctx.fill();
+  const rr = hexRng(n * 97 + (hot ? 13 : 0));
+  for (let i = 0; i < 90; i++) {
+    const a = rr(0, Math.PI * 2), rad = rr(0, 58);
+    ctx.fillStyle = `rgba(${rr(0, 1) < 0.5 ? '60,54,44' : '200,190,168'},${rr(0.03, 0.09).toFixed(2)})`;
+    ctx.beginPath(); ctx.arc(64 + Math.cos(a) * rad, 64 + Math.sin(a) * rad, rr(0.6, 1.8), 0, Math.PI * 2); ctx.fill();
+  }
+  // 彫り込んだ縁の輪(外側は明るいハイライト、内側はうっすら影)
+  ctx.strokeStyle = 'rgba(70,62,48,0.55)'; ctx.lineWidth = 3; ctx.beginPath(); ctx.arc(64, 64, 57, 0, Math.PI * 2); ctx.stroke();
+  ctx.strokeStyle = 'rgba(235,225,200,0.4)'; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(64, 64, 54, 0, Math.PI * 2); ctx.stroke();
+  const engrave = (draw) => {
+    ctx.save(); ctx.translate(1.6, 2.6); ctx.fillStyle = 'rgba(30,24,16,0.65)'; draw(); ctx.restore(); // 彫り跡の影(右下)
+    ctx.save(); ctx.translate(-1.1, -1.1); ctx.fillStyle = 'rgba(240,230,205,0.35)'; draw(); ctx.restore(); // 縁のハイライト(左上)
+    ctx.fillStyle = hot ? '#7a2015' : '#2b2318'; draw(); // 本体(6・8は赤い顔料)
+  };
+  ctx.font = 'bold 66px Georgia, serif';
   ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
-  ctx.fillText(String(n), 64, 68);
+  engrave(() => ctx.fillText(String(n), 64, 66));
   const dots = 6 - Math.abs(7 - n);
-  ctx.fillStyle = hot ? '#b8321f' : '#2a211b';
-  for (let d = 0; d < dots; d++) ctx.beginPath(), ctx.arc(64 - (dots - 1) * 7 + d * 14, 102, 3.4, 0, Math.PI * 2), ctx.fill();
+  engrave(() => { for (let d = 0; d < dots; d++) { ctx.beginPath(); ctx.arc(64 - (dots - 1) * 7 + d * 14, 101, 3.4, 0, Math.PI * 2); ctx.fill(); } });
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   numberTexCache.set(key, tex);
   return tex;
+}
+// 遠景用の控えめなラベル(半透明の円+数字)。石碑そのものより簡素(読みやすさ優先、彫り跡の演出はしない)
+const numberLabelCache = new Map();
+function numberLabelTexture(n, hot) {
+  const key = `${n}:${hot}`;
+  if (numberLabelCache.has(key)) return numberLabelCache.get(key);
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const ctx = c.getContext('2d');
+  ctx.fillStyle = 'rgba(245,238,220,0.78)'; ctx.beginPath(); ctx.arc(64, 64, 58, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(90,78,54,0.7)'; ctx.lineWidth = 4; ctx.stroke();
+  ctx.fillStyle = hot ? '#9c2e1c' : '#2a211b';
+  ctx.font = 'bold 64px Georgia, serif';
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+  ctx.fillText(String(n), 64, 68);
+  const dots = 6 - Math.abs(7 - n);
+  for (let d = 0; d < dots; d++) { ctx.beginPath(); ctx.arc(64 - (dots - 1) * 7 + d * 14, 102, 3.4, 0, Math.PI * 2); ctx.fill(); }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  numberLabelCache.set(key, tex);
+  return tex;
+}
+let chipStoneMat = null;
+function getChipStoneMaterial() { // 石碑の側面・底面(持ち主色なし。石灰岩ふうの地味な灰色)
+  if (!chipStoneMat) chipStoneMat = new THREE.MeshStandardMaterial({ color: 0x8d8574, roughness: 0.96 });
+  return chipStoneMat;
 }
 
 // ================================================================
@@ -1239,7 +1417,7 @@ function buildOcean(g, field) {
   const heightBake = buildHeightTexture(field);
   const uniforms = {
     uTime: { value: 0 },
-    uShallow: { value: new THREE.Color(0x3fe3b0) }, // 浅瀬エメラルド(少し鮮やかに)
+    uShallow: { value: new THREE.Color(0x4ff0c6) }, // 浅瀬エメラルド(⑤の直し: もう少し明るく、水色寄りに)
     uDeep: { value: new THREE.Color(0x0a2f52) }, // 沖の濃紺
     uFoam: { value: new THREE.Color(0xf3fbff) },
     uHeightTex: { value: heightBake.tex },
@@ -1270,10 +1448,15 @@ function buildOcean(g, field) {
           float raw = texture2D(uHeightTex, clamp(huv, 0.0, 1.0)).r;
           float h = mix(${HBAKE_MIN.toFixed(1)}, ${HBAKE_MAX.toFixed(1)}, raw);
           float depth = max(0.0, -h); // 海面(0)より下の深さ
-          float depthT = smoothstep(0.0, 15.0, depth);
+          // ⑤の直し: 以前はdepth=15でほぼ沖の色になり、岸のすぐそばしかエメラルドに見えなかった。
+          // 岸から数十mはしっかり浅瀬の色が残るよう、深くなる変化を広い幅(2〜24)に伸ばした。
+          float depthT = smoothstep(2.0, 24.0, depth);
           vec3 base = mix(uShallow, uDeep, depthT);
+          // 海底がうっすら透けて見えるような、ゆっくり動く陽だまり(浅いところほど効かせる)
+          float dapple = 0.5 + 0.5 * sin(vWorldPosOcean.x * 0.08 - vWorldPosOcean.z * 0.05 + uTime * 0.6);
+          base = mix(base, base * 1.22, (1.0 - depthT) * dapple * 0.4);
           // 渚のすぐそば(depthがほぼ0)に白い泡の線。硬いノイズは使わず、なめらかに揺らす
-          float foam = 1.0 - smoothstep(0.0, 2.2, depth);
+          float foam = 1.0 - smoothstep(0.0, 3.0, depth);
           float shimmer = 0.75 + 0.25 * sin(vWorldPosOcean.x * 0.05 + vWorldPosOcean.z * 0.07 + uTime * 1.2);
           base = mix(base, uFoam, foam * shimmer);
           base *= cloudShadow(vWorldPosOcean.xz, uTime);
@@ -1359,7 +1542,16 @@ export function renderBoard3D(game, uiState, overlay) {
   if (sig !== boardSignature) { boardSignature = sig; rebuildTerrainAndOcean(g); }
 
   disposeGroup(sceneGroup);
-  hitTargets = []; pulseMeshes = [];
+  hitTargets = []; pulseMeshes = []; numberLabels = []; outlineHoverTargets = [];
+  // ⑤: 持ち主色の淡い輪郭線(道・開拓地・都市)を常に出すかどうか。駒を置く場所を選んでいる・盗賊を
+  // 動かしている間は(overlayが出ている/moveRobber中)ふだんの設定に関わらず全部出す。それ以外は
+  // 設定(outlineAlways)かホバー中のものだけ。
+  // overlayには「置けない辺のうっすらした飾り線」などdata-*を持たない項目も混じるので、当たり判定の
+  // 的(data-vertex/data-edge/data-hex)を実際に持つものがあるかだけで「置ける場所を選んでいる」を判断する
+  const placementActive = (overlay || []).some((o) => o.attrs
+    && (o.attrs['data-vertex'] != null || o.attrs['data-edge'] != null || o.attrs['data-hex'] != null));
+  const ownerOutlineAlwaysOn = !!(outlineAlways || placementActive ||
+    (uiState && (uiState.mode === 'moveRobber' || uiState.mode === 'devKnightHex')));
 
   frameCamera(g);
 
@@ -1428,6 +1620,7 @@ export function renderBoard3D(game, uiState, overlay) {
       addShip(mx, mz, ang, game.players[edge.ship].color);
     } else if (edge.road != null) {
       buildRoad(B, x1, z1, x2, z2, baseY, clothColor(game.players[edge.road].color), edge.id, ang);
+      addOwnerOutlineEdge(x1, z1, x2, z2, baseY, game.players[edge.road].color, 'e' + edge.id, ownerOutlineAlwaysOn);
     }
   });
 
@@ -1439,6 +1632,8 @@ export function renderBoard3D(game, uiState, overlay) {
     const cloth = clothColor(game.players[v.building.owner].color);
     if (v.building.type === 'city') buildCity(B, g, v, x, z, baseY, cloth);
     else buildSettlement(B, g, v, x, z, baseY, cloth);
+    addOwnerOutlineVertex(x, z, baseY, v.building.type === 'city' ? 19 : 13,
+      game.players[v.building.owner].color, 'v' + v.id, ownerOutlineAlwaysOn);
   });
   [
     instancedFrom(GEO.roadTile, MAT.roadStone, B.roadTile),
@@ -1524,14 +1719,31 @@ function frameCamera(g) {
   updateSunForBoard(maxR);
 }
 
+// 数字チップ(⑤): マス中心の地面に埋め込んだ低い円形の石碑(側面・底は地味な石、上面だけ数字を彫る)+
+// カメラが遠いときだけ浮かぶ控えめなラベル(半透明の円。numberLabels に積んでanimate()で距離によりopacityを変える)
 function addNumberChip(x, z, baseY, n, hot, scale) {
-  const y = baseY + 1.5;
-  const disc = new THREE.Mesh(new THREE.CylinderGeometry(15 * scale, 15 * scale, 2.4, 20),
-    new THREE.MeshStandardMaterial({ map: numberTexture(n, hot), roughness: 0.6 }));
-  disc.rotation.x = 0;
-  disc.position.set(x, y, z);
-  disc.castShadow = true;
-  sceneGroup.add(disc);
+  const r = 15 * scale;
+  // 低く、地面に埋まって見える高さ。ただしbaseYはマス中心の平均の高さで、実際の地形メッシュは
+  // マス内の細かいノイズで上下するので、低くしすぎると地形が石碑の縁に食い込んで見える不具合があった
+  const y = baseY + 1.7 * scale;
+  const topMat = new THREE.MeshStandardMaterial({ map: numberTexture(n, hot), roughness: 0.75 });
+  const stone = getChipStoneMaterial();
+  const chip = new THREE.Mesh(new THREE.CylinderGeometry(r, r * 1.05, 2.2 * scale, 24), [stone, topMat, stone]);
+  chip.position.set(x, y, z);
+  chip.castShadow = true;
+  // ponytail: receiveShadowは立てない。小さく低いこの石碑にはnormalBias(広い地形向けの値)が
+  // 強すぎて、寄ったカメラで自分の上面にセルフシャドウのノイズが出てしまうため
+  chip.receiveShadow = false;
+  sceneGroup.add(chip);
+
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({
+    map: numberLabelTexture(n, hot), transparent: true, opacity: 0, depthWrite: false, depthTest: false,
+  }));
+  sprite.scale.setScalar(20 * scale);
+  sprite.position.set(x, y + 10 * scale, z);
+  sprite.renderOrder = 10;
+  sceneGroup.add(sprite);
+  numberLabels.push(sprite);
 }
 
 // 交換レートの控えめな看板テクスチャ(木の板に焼き印ふうの文字)。港の種類ごとにキャッシュ。
@@ -2096,28 +2308,48 @@ function buildRoad(B, x1, z1, x2, z2, baseY, cloth, edgeSeed, ang) {
     }
   });
 }
-// 盗賊: マント(裾広がりの円錐)・肩の襟巻き(トーラス)・頭・とがり帽子のつば
+// マスにうっすら落ちる暗い影・霧(盗賊・海賊がどのマスにいるかを一目で分かるようにする)
+function addGroundShade(cx, y, cz, r) {
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(r, 24),
+    new THREE.MeshBasicMaterial({ color: 0x0a0b10, transparent: true, opacity: 0.34, depthWrite: false }));
+  disc.rotation.x = -Math.PI / 2;
+  disc.position.set(cx, y, cz);
+  sceneGroup.add(disc);
+}
+// 盗賊: 黒い外套の一団(3人、三角の隊形)。マスには暗い影を落とす
 function addRobber(cx, height, cz, blink) {
+  addGroundShade(cx, height + 0.3, cz, SCALE * 0.56);
   const cloakMat = new THREE.MeshStandardMaterial({ color: 0x1c1b22, roughness: 0.9 });
-  const body = new THREE.Mesh(new THREE.ConeGeometry(9, 22, 8), cloakMat);
-  body.position.set(cx, height + 11, cz);
-  const collar = new THREE.Mesh(new THREE.TorusGeometry(5, 1.6, 6, 10), cloakMat);
-  collar.rotation.x = Math.PI / 2;
-  collar.position.set(cx, height + 20, cz);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(6, 8, 6), new THREE.MeshStandardMaterial({ color: 0x2d2c36, roughness: 0.85 }));
-  head.position.set(cx, height + 25, cz);
-  const brim = new THREE.Mesh(new THREE.ConeGeometry(7, 3, 8), cloakMat);
-  brim.position.set(cx, height + 29, cz);
-  sceneGroup.add(body, collar, head, brim);
+  const headMat = new THREE.MeshStandardMaterial({ color: 0x2d2c36, roughness: 0.85 });
+  [[0, 0, 1], [-8, 5, 0.68], [8, -4, 0.68]].forEach(([dx, dz, s]) => {
+    const x = cx + dx, z = cz + dz;
+    const body = new THREE.Mesh(new THREE.ConeGeometry(9 * s, 22 * s, 8), cloakMat);
+    body.position.set(x, height + 11 * s, z);
+    const collar = new THREE.Mesh(new THREE.TorusGeometry(5 * s, 1.6 * s, 6, 10), cloakMat);
+    collar.rotation.x = Math.PI / 2;
+    collar.position.set(x, height + 20 * s, z);
+    const head = new THREE.Mesh(new THREE.SphereGeometry(6 * s, 8, 6), headMat);
+    head.position.set(x, height + 25 * s, z);
+    const brim = new THREE.Mesh(new THREE.ConeGeometry(7 * s, 3 * s, 8), cloakMat);
+    brim.position.set(x, height + 29 * s, z);
+    [body, collar, head, brim].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
+  });
   if (blink) addPulseRing(cx, height + 1, cz, 20, 0xffd84a);
 }
+// 海賊(蛮族の船。拡張): 黒い帆の船+海面に落ちる暗い影
 function addPirate(cx, height, cz, blink) {
-  const hull = new THREE.Mesh(GEO.shipHull, new THREE.MeshStandardMaterial({ color: 0x2b1d10, roughness: 0.85 }));
+  addGroundShade(cx, SEA_LEVEL + 0.3, cz, SCALE * 0.56);
+  const hull = new THREE.Mesh(GEO.shipHull, new THREE.MeshStandardMaterial({ color: 0x151008, roughness: 0.85 }));
   hull.scale.set(22 / 16, 6 / 4.6, 14 / 6.4); // 航海者の船と同じ形(舳先がとがった船体)を蛮族の船の大きさに拡大
   hull.position.set(cx, height + 3, cz);
-  hull.castShadow = true;
-  sceneGroup.add(hull);
-  addRobber(cx, height + 4, cz, blink);
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.5, 13, 6), MAT.signPost);
+  mast.position.set(cx, height + 9.5, cz);
+  const sail = new THREE.Mesh(new THREE.ConeGeometry(6.5, 11, 3),
+    new THREE.MeshStandardMaterial({ color: 0x100e10, roughness: 0.82, side: THREE.DoubleSide }));
+  sail.rotation.z = Math.PI / 2; sail.rotation.y = Math.PI / 6;
+  sail.position.set(cx, height + 11.5, cz);
+  [hull, mast, sail].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
+  if (blink) addPulseRing(cx, height + 1, cz, 20, 0xffd84a);
 }
 function addPulseRing(x, y, z, r, color) {
   const ring = new THREE.Mesh(new THREE.TorusGeometry(r, 1.6, 6, 28),
@@ -2130,41 +2362,101 @@ function addPulseRing(x, y, z, r, color) {
 }
 
 // overlay の1件(頂点/辺/マスの当たり判定)を、光る的として3Dに置く
+// 持ち主色の淡い輪郭線(⑤)。ふだんは隠し、alwaysOn(駒を置く場所を選んでいる・盗賊を動かしている・
+// 設定で常時表示)かホバー中だけ見せる。当たり判定用の透明な的も同じ場所に重ねておき(ホバー検出専用、
+// hitTargets/onTapには入れない)、attachInputのpointermoveで出し入れする。
+function addOwnerOutlineVertex(x, z, baseY, radius, colorHex, key, alwaysOn) {
+  const y = groundY(x, z, baseY) + 0.5;
+  const visual = new THREE.Mesh(new THREE.RingGeometry(radius - 1.6, radius, 28),
+    new THREE.MeshStandardMaterial({ color: colorHex, emissive: colorHex, emissiveIntensity: 0.5, transparent: true, opacity: 0.55, side: THREE.DoubleSide, depthWrite: false }));
+  visual.rotation.x = -Math.PI / 2;
+  visual.position.set(x, y, z);
+  visual.visible = alwaysOn || key === hoveredOutlineKey;
+  sceneGroup.add(visual);
+  const hit = new THREE.Mesh(new THREE.CylinderGeometry(radius, radius, 4, 16),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 }));
+  hit.position.set(x, y, z);
+  sceneGroup.add(hit);
+  outlineHoverTargets.push({ hitMesh: hit, visualMesh: visual, alwaysOn, key });
+}
+function addOwnerOutlineEdge(x1, z1, x2, z2, baseY, colorHex, key, alwaysOn) {
+  const mx = (x1 + x2) / 2, mz = (z1 + z2) / 2;
+  const len = Math.hypot(x2 - x1, z2 - z1);
+  const ang = -Math.atan2(z2 - z1, x2 - x1);
+  const y = groundY(mx, mz, baseY) + 0.5;
+  const visual = new THREE.Mesh(new THREE.PlaneGeometry(len * 0.85, 13),
+    new THREE.MeshStandardMaterial({ color: colorHex, emissive: colorHex, emissiveIntensity: 0.4, transparent: true, opacity: 0.3, side: THREE.DoubleSide, depthWrite: false }));
+  visual.rotation.x = -Math.PI / 2; visual.rotation.z = ang;
+  visual.position.set(mx, y, mz);
+  visual.visible = alwaysOn || key === hoveredOutlineKey;
+  sceneGroup.add(visual);
+  const hit = new THREE.Mesh(new THREE.BoxGeometry(len * 0.85, 4, 13),
+    new THREE.MeshBasicMaterial({ transparent: true, opacity: 0 }));
+  hit.rotation.y = ang;
+  hit.position.set(mx, y, mz);
+  sceneGroup.add(hit);
+  outlineHoverTargets.push({ hitMesh: hit, visualMesh: visual, alwaysOn, key });
+}
+
+// overlay の1件(頂点/辺/マスの当たり判定)を、光る的として3Dに置く。
+// ⑤の直し: 塗りつぶした板だと風景の上に置物を置いたように見えるので、見た目は「地面に沿った細い光の線」
+// (頂点=光の輪、辺=光る帯、マス=六角の輪郭線)にした。タップの当たり判定は今までと同じ大きさの板を
+// そのまま使うが、見た目には出さない(ごく薄い透明)。
+const HIT_MAT_OPACITY = 0.02; // 0だと一部ブラウザでレイキャストの挙動を変えたくないので、ごくわずかだけ残す
 function addOverlayTarget(g, o) {
   const a = o.attrs;
   if (a['data-vertex'] != null) {
     const v = g.vertices[Number(a['data-vertex'])];
     const baseY = baseYOfHex(firstHexAt(g, v.hexIds));
-    const mesh = new THREE.Mesh(new THREE.CylinderGeometry(9, 9, 3, 16),
-      new THREE.MeshStandardMaterial({ color: 0xf0cf85, emissive: 0xf0cf85, emissiveIntensity: 0.6, transparent: true, opacity: 0.9 }));
-    mesh.position.set(v.x * SCALE, baseY + 2, v.y * SCALE);
-    mesh.userData.baseScale = 1;
-    sceneGroup.add(mesh);
-    hitTargets.push({ mesh, kind: 'vertex', id: v.id });
-    pulseMeshes.push(mesh);
+    const x = v.x * SCALE, z = v.y * SCALE;
+    const hit = new THREE.Mesh(new THREE.CylinderGeometry(9, 9, 3, 16),
+      new THREE.MeshStandardMaterial({ color: 0xf0cf85, transparent: true, opacity: HIT_MAT_OPACITY }));
+    hit.position.set(x, baseY + 2, z);
+    sceneGroup.add(hit);
+    hitTargets.push({ mesh: hit, kind: 'vertex', id: v.id });
+    const ring = new THREE.Mesh(new THREE.RingGeometry(6.5, 8.6, 24),
+      new THREE.MeshStandardMaterial({ color: 0xffe3a0, emissive: 0xf0cf85, emissiveIntensity: 0.9, transparent: true, opacity: 0.95, side: THREE.DoubleSide }));
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(x, groundY(x, z, baseY) + 0.6, z);
+    ring.userData.baseScale = 1;
+    sceneGroup.add(ring);
+    pulseMeshes.push(ring);
   } else if (a['data-edge'] != null) {
     const e = g.edges[Number(a['data-edge'])];
     const v1 = g.vertices[e.v1], v2 = g.vertices[e.v2];
     const x1 = v1.x * SCALE, z1 = v1.y * SCALE, x2 = v2.x * SCALE, z2 = v2.y * SCALE;
     const baseY = baseYOfHex(firstHexAt(g, e.hexIds));
     const len = Math.hypot(x2 - x1, z2 - z1);
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(len * 0.8, 3, 11),
-      new THREE.MeshStandardMaterial({ color: 0xf0cf85, emissive: 0xf0cf85, emissiveIntensity: 0.6, transparent: true, opacity: 0.85 }));
-    mesh.position.set((x1 + x2) / 2, baseY + 2, (z1 + z2) / 2);
-    mesh.rotation.y = -Math.atan2(z2 - z1, x2 - x1);
-    sceneGroup.add(mesh);
-    hitTargets.push({ mesh, kind: 'edge', id: e.id });
-    pulseMeshes.push(mesh);
+    const mx = (x1 + x2) / 2, mz = (z1 + z2) / 2, ang = -Math.atan2(z2 - z1, x2 - x1);
+    const hit = new THREE.Mesh(new THREE.BoxGeometry(len * 0.8, 3, 11),
+      new THREE.MeshStandardMaterial({ color: 0xf0cf85, transparent: true, opacity: HIT_MAT_OPACITY }));
+    hit.position.set(mx, baseY + 2, mz);
+    hit.rotation.y = ang;
+    sceneGroup.add(hit);
+    hitTargets.push({ mesh: hit, kind: 'edge', id: e.id });
+    const band = new THREE.Mesh(new THREE.PlaneGeometry(len * 0.82, 5),
+      new THREE.MeshStandardMaterial({ color: 0xffe3a0, emissive: 0xf0cf85, emissiveIntensity: 0.9, transparent: true, opacity: 0.85, side: THREE.DoubleSide }));
+    band.rotation.x = -Math.PI / 2; band.rotation.z = ang;
+    band.position.set(mx, groundY(mx, mz, baseY) + 0.6, mz);
+    band.userData.baseScale = 1;
+    sceneGroup.add(band);
+    pulseMeshes.push(band);
   } else if (a['data-hex'] != null) {
     const hex = g.hexes[Number(a['data-hex'])];
     const [cx, cz] = hexCenterOf(g, hex);
     const height = baseYOfHex(hex);
     const pts = hexPointsOf(g, hex);
-    const mesh = new THREE.Mesh(flatHexGeometry(pts.map(([x, z]) => [x - cx, z - cz]), 0),
-      new THREE.MeshStandardMaterial({ color: 0xffe9a8, emissive: 0xffd84a, emissiveIntensity: 0.5, transparent: true, opacity: 0.55, side: THREE.DoubleSide }));
-    mesh.position.set(cx, height + 1, cz);
-    sceneGroup.add(mesh);
-    hitTargets.push({ mesh, kind: 'hex', id: hex.id });
-    pulseMeshes.push(mesh);
+    const localPts = pts.map(([x, z]) => [x - cx, z - cz]);
+    const hit = new THREE.Mesh(flatHexGeometry(localPts, 0),
+      new THREE.MeshStandardMaterial({ color: 0xffe9a8, transparent: true, opacity: HIT_MAT_OPACITY, side: THREE.DoubleSide }));
+    hit.position.set(cx, height + 1, cz);
+    sceneGroup.add(hit);
+    hitTargets.push({ mesh: hit, kind: 'hex', id: hex.id });
+    const outline = new THREE.Mesh(hexRingGeometry(localPts, 0, 0.9),
+      new THREE.MeshStandardMaterial({ color: 0xffe9a8, emissive: 0xffd84a, emissiveIntensity: 0.8, transparent: true, opacity: 0.9, side: THREE.DoubleSide }));
+    outline.position.set(cx, height + 1.4, cz);
+    outline.userData.baseScale = 1;
+    sceneGroup.add(outline);
+    pulseMeshes.push(outline);
   }
 }

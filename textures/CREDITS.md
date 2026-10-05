@@ -29,3 +29,8 @@ Poly Havenは非営利の素材サイト（https://polyhaven.com/）。
 マスの境目は、頂点カラーでわずかに暗く落として縫い目をなじませている(別のテクスチャは足していない)。
 海はテクスチャを使わず、自前のShaderMaterialで深さに応じた色のグラデーションを計算している
 (three.jsのWater.js/vendor化は見送った。理由はboard3d.jsのbuildOcean()のコメント参照)。
+
+数字チップ(石碑に彫った数字・遠景のラベル)も新しい画像ファイルは足していない。Canvas 2Dで
+その場で焼いたテクスチャ(numberTexture/numberLabelTexture)で、石碑の側面・底面は上のmountains一式
+ではなく無地のMeshStandardMaterial(getChipStoneMaterial)。輪郭線(置ける場所・持ち主色)もテクスチャ
+を使わない単色の板・輪ジオメトリ。

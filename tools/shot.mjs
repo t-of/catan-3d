@@ -11,6 +11,11 @@
 //   (capture/terrainに --query "&x=1" を付けると撮影URLに足す。調べもの用)
 //   node tools/shot.mjs compare --out <png> --set "ラベル:ref=<commit>,q=<mid|high>" --set "ラベル2:..." ...
 //     → 複数の組をまとめて撮り、ラベル付きで並べた1枚を作る(行=組、列=カメラ)
+//   node tools/shot.mjs scene --case <name> [--quality mid|high] [--out <出力先>] [--tag <名前>]
+//     → ⑤(数字チップ・強調表示)の確認用の決まった場面を1枚撮る。--case:
+//       setupVertex(開拓地を置ける頂点の光る輪) / setupEdge(道を置ける辺) / moveRobber(盗賊を動かせるマス)
+//       outlineAlways(輪郭線を常に表示) / settingsOpen(設定パネル) / chipClose(数字の石碑の寄り)
+//       chipFar(遠いカメラの数字ラベル)
 //
 // --ref を省くと今の作業ツリー(このファイルのあるリポジトリ)をそのまま使う。
 // --ref にコミットを指定すると git worktree で一時フォルダに取り出し、そこを配る。
@@ -303,6 +308,105 @@ async function cmdFrame(args) {
   } finally { cleanup(); }
 }
 
+// ---- ⑤確認用の決まった場面(scene) ----
+function hexCenterOfGame(game, hex) {
+  const vs = hex.vertexIds.map((id) => game.board.vertices[id]);
+  return [vs.reduce((a, v) => a + v.x, 0) / vs.length * SCALE, vs.reduce((a, v) => a + v.y, 0) / vs.length * SCALE];
+}
+function sceneSetupVertex() {
+  const rng = mulberry32(20261005);
+  const game = E.createGame(3, rng, { names: ['プレイヤー1', 'プレイヤー2', 'プレイヤー3'] }); // setup1/settlementのまま
+  const seats = Array.from({ length: 3 }, () => ({ type: 'human', level: 'normal' }));
+  const cams = cameraPresets(game, game.board.vertices[0]);
+  return { game, seats, cam: cams.default };
+}
+function sceneSetupEdge() {
+  const rng = mulberry32(20261005);
+  const game = E.createGame(3, rng, { names: ['プレイヤー1', 'プレイヤー2', 'プレイヤー3'] });
+  if (!game.board.vertices.some((v) => E.setupPlaceSettlement(game, v.id))) throw new Error('置ける頂点がない');
+  const seats = Array.from({ length: 3 }, () => ({ type: 'human', level: 'normal' }));
+  const v = game.board.vertices[game.setupLastVertex];
+  const cams = cameraPresets(game, v);
+  return { game, seats, cam: cams.close };
+}
+function sceneMoveRobber() {
+  const { game, seats, cityVertex } = buildFixedGame();
+  game.phase = 'moveRobber';
+  const cams = cameraPresets(game, cityVertex);
+  return { game, seats, cam: cams.default };
+}
+function sceneIdleDefault(useClose) {
+  const { game, seats, cityVertex } = buildFixedGame();
+  const cams = cameraPresets(game, cityVertex);
+  return { game, seats, cam: useClose ? cams.close : cams.default };
+}
+function sceneChip(far) {
+  const { game, seats } = buildFixedGame();
+  const builtVertexIds = new Set(game.board.vertices.filter((v) => v.building).map((v) => v.id));
+  // 建物が隣にない数字マス(石碑が家で隠れない所)を選ぶ
+  // 木の影が数字に重ならない地形(森以外)・隣に建物がない・一桁のマスを優先して選ぶ
+  const openTerrains = new Set(['field', 'pasture', 'desert', 'hills']);
+  const candidates = game.board.hexes.filter((h) => h.number != null && h.number < 10 && !h.fog
+    && !h.vertexIds.some((id) => builtVertexIds.has(id)));
+  const hex = candidates.find((h) => openTerrains.has(h.terrain)) || candidates[0];
+  const [cx, cz] = hexCenterOfGame(game, hex || game.board.hexes.find((h) => h.number != null));
+  const cam = far
+    ? { pos: [cx + 560, 300, cz + 560], tgt: [cx, 10, cz] } // 数字ラベルが浮かぶくらい遠く
+    : { pos: [cx - 46, 70, cz - 46], tgt: [cx, 2, cz] }; // 石碑の真上寄り(マス境の生け垣の影が入らない向き)
+  return { game, seats, cam };
+}
+const SCENES = {
+  setupVertex: sceneSetupVertex,
+  setupEdge: sceneSetupEdge,
+  moveRobber: sceneMoveRobber,
+  outlineAlways: () => sceneIdleDefault(true),
+  settingsOpen: sceneIdleDefault,
+  chipClose: () => sceneChip(false),
+  chipFar: () => sceneChip(true),
+};
+async function shootScene(browser, base, quality, spec, extraLS, afterLoad) {
+  const page = await browser.newPage({ viewport: { width: 1280, height: 800 } });
+  page.on('console', (m) => { if (m.type() === 'error' || m.type() === 'warning') console.log(`[${m.type()}]`, m.text().slice(0, 2000)); });
+  page.on('pageerror', (e) => console.log('[pageerror]', e.message));
+  await page.addInitScript(([g, s, ls]) => {
+    localStorage.setItem('catan-3d.game', JSON.stringify(g));
+    localStorage.setItem('catan-3d.gameSeats', JSON.stringify(s));
+    localStorage.setItem('catan-3d.motion', 'false');
+    Object.entries(ls).forEach(([k, v]) => localStorage.setItem(k, v));
+  }, [spec.game, spec.seats, extraLS || {}]);
+  const url = `${base}/?q=${quality}&cam=${encodeURIComponent(camParam(spec.cam))}${EXTRA_QUERY}`;
+  await page.goto(url, { waitUntil: 'load' });
+  await page.locator('#continueBtn').waitFor({ state: 'visible', timeout: 5000 });
+  await page.locator('#continueBtn').click();
+  await page.waitForTimeout(1200);
+  if (afterLoad) await afterLoad(page);
+  const shot = await page.screenshot();
+  await page.close();
+  return shot;
+}
+async function cmdScene(args) {
+  const name = args.case;
+  const build = SCENES[name];
+  if (!build) { console.error('--case が要る(どれか):', Object.keys(SCENES).join(', ')); process.exit(1); }
+  const outDir = args.out || path.join(HUB, '.audit');
+  fs.mkdirSync(outDir, { recursive: true });
+  const { dir, cleanup } = resolveTreeDir(args.ref || '');
+  try {
+    await withBrowser(async (browser) => {
+      const server = await serveDir(dir);
+      const base = `http://127.0.0.1:${server.address().port}`;
+      const spec = build();
+      const extraLS = name === 'outlineAlways' ? { 'catan-3d.outlineAlways': '1' } : {};
+      const afterLoad = name === 'settingsOpen' ? async (page) => { await page.getByLabel('盤の表示設定を開く').click(); } : null;
+      const buf = await shootScene(browser, base, args.quality || 'mid', spec, extraLS, afterLoad);
+      const file = path.join(outDir, `${args.tag || name}.png`);
+      fs.writeFileSync(file, buf);
+      console.log('書いた:', file);
+      server.close();
+    });
+  } finally { cleanup(); }
+}
+
 const [, , cmd, ...rest] = process.argv;
 const args = parseArgs(rest);
 // --query "&foo=1" で撮影URLに任意のクエリを足せる(調べもの用)
@@ -311,4 +415,5 @@ if (cmd === 'capture') await cmdCapture(args);
 else if (cmd === 'compare') await cmdCompare(args);
 else if (cmd === 'frame') await cmdFrame(args);
 else if (cmd === 'terrain') await cmdTerrain(args);
-else { console.error('使い方: shot.mjs capture|compare|frame|terrain ...'); process.exit(1); }
+else if (cmd === 'scene') await cmdScene(args);
+else { console.error('使い方: shot.mjs capture|compare|frame|terrain|scene ...'); process.exit(1); }
