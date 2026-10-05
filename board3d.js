@@ -6,9 +6,11 @@
 //   renderBoard3D(game, uiState, overlay) … 盤を描き直すたびに呼ぶ（main.jsのrenderBoardIntoと同じ頻度でよい）
 //     overlay は renderBoardInto が返す配列（置ける頂点・辺・マスの当たり判定の素）をそのまま渡す。
 //
-// SVG版（main.jsのrenderBoardInto）と同じく、呼ばれるたびに中身を全部作り直す。
-// ponytail: 盤は見た目を変える操作のたびにしか作り直されない（連続アニメーションではない）ので、
-// 毎回丸ごと作り直しても重くならない。木や羊などの繰り返しはInstancedMeshでまとめ、台数を抑える。
+// SVG版（main.jsのrenderBoardInto）と同じく、呼ばれるたびに小物（木・羊・建物・盗賊など）は作り直す。
+// 地形（島）と海は盤の形が変わったとき（拡張など、hexの並びが変わったとき）だけ作り直す重いメッシュなので、
+// 作り直さず使い回す（sceneGroupとは別に地形用のグループを持つ）。
+//
+// 画質: URLの?q=highで細かい地形メッシュ(QUALITY参照)。無指定/他の値は中品質。⑤までにUIの設定を足す。
 import * as THREE from './vendor/three.module.min.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { RoomEnvironment } from './vendor/RoomEnvironment.js';
@@ -16,67 +18,73 @@ import { RGBELoader } from './vendor/RGBELoader.js';
 
 const SCALE = 66; // main.jsのSCALEと同じ値（頂点のx,yをこの倍率でワールド座標にする）
 const REDUCE_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+const QUALITY = (() => { try { return new URLSearchParams(location.search).get('q') === 'high' ? 'high' : 'mid'; } catch { return 'mid'; } })();
+// ponytail: 品質はこの定数だけで決める。⑤でUIのトグルを足すときはここを書き換える処理を足すだけでよい。
+const Q = {
+  mid: { cell: 7, maxGrid: 140 },
+  high: { cell: 3.2, maxGrid: 260 },
+}[QUALITY];
 
-// ---- 地形ごとの色・高さ（illust.jsのTERRAIN_STYLEと同じ地形名） ----
-const TERRAIN_COLOR = { // catan（2D）のillust.jsのグラデーション2色の中間
-  forest: 0x40854b, pasture: 0xa0cc6f, field: 0xe4be56, hills: 0xc97448,
-  mountains: 0x99a0af, desert: 0xe4d19d, water: 0x1d6c81, gold: 0xe2bf5c,
-  lake: 0x1d6c81, castle: 0x99a0af, pitch: 0xa0cc6f, fog: 0x7c8e87,
-};
-const LAND_HEIGHT = 12; // 陸のマスはすべて同じ高さ。水だけ低い
-const TERRAIN_HEIGHT = {
-  forest: LAND_HEIGHT, pasture: LAND_HEIGHT, field: LAND_HEIGHT, hills: LAND_HEIGHT, mountains: LAND_HEIGHT,
-  desert: LAND_HEIGHT, water: 3, gold: LAND_HEIGHT, lake: 3, castle: LAND_HEIGHT, pitch: LAND_HEIGHT, fog: LAND_HEIGHT,
-};
+// ---- 地形の寸法(engine.jsのhexCorner/hexCenterと同じ単位。circumradius=1をSCALE倍) ----
+const HEX_R = SCALE; // 中心→頂点(円周半径)
+const HEX_A = SCALE * Math.sqrt(3) / 2; // 中心→辺の中点(アポセム)
+const LAND_BASE = 14; // 陸の基準の高さ(マス中心の平らな部分)
+const SEA_LEVEL = 0; // 海面(港・船・浮く物の基準)
+const SHELF = -9; // 渚のすぐ沖(浅瀬の棚)。海面(0)の波の揺れ(最大±2.5ほど)より十分下げて、海面と重ならないようにする
+const SEABED = -22; // 沖の海底
+const BOUNDARY_LO = 0.74, BOUNDARY_HI = 1.02; // マス中心からの距離(÷アポセム)のうち、起伏を減衰させはじめる~境目に達する範囲
 const RES_COLOR3D = { wood: 0x3f8a4a, brick: 0xc0643a, sheep: 0x8cc063, wheat: 0xe0b440, ore: 0x8a92a3 };
-const TERRAIN_ROUGH = {
-  forest: 0.95, pasture: 0.85, field: 0.7, hills: 0.9, mountains: 0.95, desert: 0.9,
-  water: 0.2, gold: 0.5, lake: 0.2, castle: 0.8, pitch: 0.65, fog: 0.9,
+
+// 地形ごとのCC0 PBR一式(出典はtextures/CREDITS.md)。gold/castle/pitch/lake/fogは拡張用の特殊地形で、
+// 見た目は代用(pasture寄り)にする。water/lakeは地面でなく海(terrainSample内で別扱い)。
+const TERRAIN_SET = {
+  forest: 'forest', pasture: 'pasture', field: 'field', hills: 'hills', mountains: 'mountains', desert: 'desert',
 };
-// CC0の実写テクスチャ(Poly Haven、出典はtextures/CREDITS.md)の凹凸(法線)だけを使う地形。
-// 色は2Dと揃えるため、どの地形も手続き的なCanvasの模様(TERRAIN_COLOR)にする。
-const TERRAIN_PHOTO = {
-  forest: './textures/forest.jpg', pasture: './textures/pasture.jpg', field: './textures/field.jpg',
-  hills: './textures/hills.jpg', mountains: './textures/mountains.jpg', desert: './textures/desert.jpg',
-};
+const WATER_LIKE = new Set(['water', 'lake']);
 
 let scene, camera, renderer, controls, raycaster, pointer, clock, sun;
-let sceneGroup; // 毎回まるごと作り直す盤の中身
+let sceneGroup; // 毎回まるごと作り直す小物(木・建物・盗賊・overlayなど)
+let terrainGroup = null; // 地形(島)のメッシュ。盤の形が変わったときだけ作り直す
+let oceanMesh = null; // 海。盤の形が変わったときだけ作り直す
+let boardSignature = null; // 地形メッシュ・海を作り直すべきかの目印(hex数+地形の並び)
+let hexHeight = new Map(); // hex.id -> マス中心の高さ(小物を置く基準の高さ)
 let onTapCb = null;
 let hitTargets = []; // [{ mesh, kind, id }]（レイキャストで拾う的）
-let waterMeshes = []; // 波で揺らすタイル
 let pulseMeshes = []; // 明滅させる的（置ける場所・盗賊など）
 let framedForHexCount = null;
+let oceanUniforms = null;
 
 // ---- 共通ジオメトリ（使い回す。インスタンスごとに作らない） ----
 const GEO = {
-  trunk: new THREE.CylinderGeometry(1.6, 2, 9, 6),
-  canopy: new THREE.ConeGeometry(7, 16, 7),
-  sheep: new THREE.SphereGeometry(5, 8, 6),
-  wheat: new THREE.ConeGeometry(2.2, 9, 5),
-  mound: new THREE.SphereGeometry(10, 8, 6),
-  peak: new THREE.ConeGeometry(9, 22, 5),
-  snowCap: new THREE.ConeGeometry(3.4, 7, 5),
-  dune: new THREE.ConeGeometry(14, 5, 10),
-  cactusBody: new THREE.CylinderGeometry(2.2, 2.6, 16, 7),
+  trunk: new THREE.CylinderGeometry(1.6, 2, 9, 7),
+  canopy: new THREE.ConeGeometry(7, 16, 8),
+  sheep: new THREE.SphereGeometry(5, 10, 8),
+  wheat: new THREE.ConeGeometry(2.2, 9, 6),
+  mound: new THREE.SphereGeometry(10, 10, 8),
+  peak: new THREE.ConeGeometry(9, 22, 6),
+  snowCap: new THREE.ConeGeometry(3.4, 7, 6),
+  dune: new THREE.ConeGeometry(14, 5, 12),
+  cactusBody: new THREE.CylinderGeometry(2.2, 2.6, 16, 8),
   nugget: new THREE.OctahedronGeometry(3.4, 0),
-  road: new THREE.CylinderGeometry(3.4, 3.4, 1, 7), // 角を落とした木の棒(断面が七角形の丸太)。長さはmeshのscale.yで伸ばす
+  road: new THREE.CylinderGeometry(3.4, 3.4, 1, 8), // 角を落とした木の棒(断面が八角形の丸太)。長さはmeshのscale.yで伸ばす
 };
 const MAT = {
-  bark: new THREE.MeshStandardMaterial({ color: 0x5b3a22, flatShading: true, roughness: 0.95 }),
-  leaf: new THREE.MeshStandardMaterial({ color: 0x387a44, flatShading: true, roughness: 0.9 }),
-  sheep: new THREE.MeshStandardMaterial({ color: 0xf4f1e6, flatShading: true, roughness: 0.85 }),
-  wheat: new THREE.MeshStandardMaterial({ color: 0xe4b63e, flatShading: true, roughness: 0.8 }),
-  mound: new THREE.MeshStandardMaterial({ color: 0xa15c34, flatShading: true, roughness: 0.95 }),
-  peak: new THREE.MeshStandardMaterial({ color: 0x9aa0ac, flatShading: true, roughness: 0.9 }),
-  snow: new THREE.MeshStandardMaterial({ color: 0xf4f8ff, flatShading: true, roughness: 0.7 }),
-  sand: new THREE.MeshStandardMaterial({ color: 0xdfc688, flatShading: true, roughness: 1 }),
-  cactus: new THREE.MeshStandardMaterial({ color: 0x4f8a43, flatShading: true, roughness: 0.9 }),
-  gold: new THREE.MeshStandardMaterial({ color: 0xf0c83c, flatShading: true, roughness: 0.4, metalness: 0.6, emissive: 0x4a3a00 }),
+  bark: new THREE.MeshStandardMaterial({ color: 0x5b3a22, roughness: 0.95 }),
+  leaf: new THREE.MeshStandardMaterial({ color: 0x387a44, roughness: 0.9 }),
+  sheep: new THREE.MeshStandardMaterial({ color: 0xf4f1e6, roughness: 0.85 }),
+  wheat: new THREE.MeshStandardMaterial({ color: 0xe4b63e, roughness: 0.8 }),
+  mound: new THREE.MeshStandardMaterial({ color: 0xa15c34, roughness: 0.95 }),
+  peak: new THREE.MeshStandardMaterial({ color: 0x9aa0ac, roughness: 0.9 }),
+  snow: new THREE.MeshStandardMaterial({ color: 0xf4f8ff, roughness: 0.7 }),
+  sand: new THREE.MeshStandardMaterial({ color: 0xdfc688, roughness: 1 }),
+  cactus: new THREE.MeshStandardMaterial({ color: 0x4f8a43, roughness: 0.9 }),
+  gold: new THREE.MeshStandardMaterial({ color: 0xf0c83c, roughness: 0.4, metalness: 0.6, emissive: 0x4a3a00 }),
 };
-const TERRAIN_MAT = {}; // 地形ごとのタイル材質（テクスチャ付き）。terrainTexture()と一緒に使い回す
+const TERRAIN_MAT = {}; // 地形ごとのタイル材質(一度作ったら使い回す)。terrainTextures()の結果と対応
 
 function clampUnit(v) { return Math.min(1, Math.max(0, v)); }
+function smoothstep(lo, hi, v) { const t = clampUnit((v - lo) / (hi - lo)); return t * t * (3 - 2 * t); }
+function lerp(a, b, t) { return a + (b - a) * t; }
 
 export function initBoard3D(container, onTap) {
   onTapCb = onTap;
@@ -135,6 +143,7 @@ export function initBoard3D(container, onTap) {
   attachInput(renderer.domElement);
   new ResizeObserver(() => resize(container)).observe(container);
   resize(container);
+  applyDebugCamera(); // ?camのデバッグ用カメラ固定(なければ何もしない)
   renderer.setAnimationLoop(animate);
 }
 
@@ -143,6 +152,20 @@ function resize(container) {
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   renderer.setSize(w, h, false);
+}
+
+// 比較用スクリーンショットのための一時的なデバッグ口。
+// ?cam=x,y,z,tx,ty,tz を付けたときだけカメラを固定する(なければ何もしない)。本番の操作には使わない。
+function applyDebugCamera() {
+  let raw;
+  try { raw = new URLSearchParams(location.search).get('cam'); } catch { raw = null; }
+  if (!raw) return;
+  const n = raw.split(',').map(Number);
+  if (n.length < 6 || n.some((v) => !Number.isFinite(v))) return;
+  camera.position.set(n[0], n[1], n[2]);
+  controls.target.set(n[3], n[4], n[5]);
+  controls.enabled = false;
+  controls.update();
 }
 
 // ---- タップ／ドラッグの見分け（しきい値を超えて動いたら回転操作として無視する） ----
@@ -189,10 +212,7 @@ function skyTexture() {
 
 function animate() {
   const t = clock.getElapsedTime();
-  if (!REDUCE_MOTION) waterMeshes.forEach((m, i) => {
-    m.position.y = m.userData.baseY + Math.sin(t * 1.6 + i * 1.7) * 1.6;
-    m.rotation.z = Math.sin(t * 0.8 + i) * 0.015;
-  });
+  if (oceanUniforms && !REDUCE_MOTION) oceanUniforms.uTime.value = t;
   pulseMeshes.forEach((m, i) => {
     const k = 0.55 + Math.sin(t * 3 + i * 0.6) * 0.45;
     if (m.material.emissiveIntensity != null) m.material.emissiveIntensity = 0.4 + k * 1.1;
@@ -210,40 +230,21 @@ function hexCenterOf(g, hex) {
 function hexPointsOf(g, hex) {
   return hex.vertexIds.map((id) => { const v = g.vertices[id]; return [v.x * SCALE, v.y * SCALE]; });
 }
-// 六角柱（上面・側面だけ。底面は海に隠れて見えないので省く）。
-// 上の縁を少し面取りして、平らな板ではなく厚みのあるタイルに見せる。
-function hexPrismGeometry(pts, height) {
+// overlayの的(置ける場所の光る六角形)専用の薄い板。地形メッシュとは別物(厚みも面取りもない簡素な形でよい)
+function flatHexGeometry(pts, y) {
   const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length;
   const cz = pts.reduce((a, p) => a + p[1], 0) / pts.length;
-  const bevel = Math.min(5, height * 0.25);
-  const inner = pts.map((p) => [cx + (p[0] - cx) * 0.86, cz + (p[1] - cz) * 0.86]);
-  const outerY = height - bevel;
-  const pos = [], uv = [];
+  const pos = [];
   const n = pts.length;
-  const uvOf = (x, z) => [(x - cx) / (SCALE * 1.3) * 0.5 + 0.5, (z - cz) / (SCALE * 1.3) * 0.5 + 0.5];
-  const push3 = (p0, p1, p2) => {
-    pos.push(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], p2[0], p2[1], p2[2]);
-    uv.push(...uvOf(p0[0], p0[2]), ...uvOf(p1[0], p1[2]), ...uvOf(p2[0], p2[2]));
-  };
   for (let i = 0; i < n; i++) {
     const a = pts[i], b = pts[(i + 1) % n];
-    const ia = inner[i], ib = inner[(i + 1) % n];
-    // 内側の平らな天面
-    push3([cx, height, cz], [ib[0], height, ib[1]], [ia[0], height, ia[1]]);
-    // 面取りの斜面（内側の縁→外側の縁）
-    push3([ia[0], height, ia[1]], [ib[0], height, ib[1]], [b[0], outerY, b[1]]);
-    push3([ia[0], height, ia[1]], [b[0], outerY, b[1]], [a[0], outerY, a[1]]);
-    // 側面（外側の縁→地面）
-    push3([a[0], outerY, a[1]], [b[0], outerY, b[1]], [b[0], 0, b[1]]);
-    push3([a[0], outerY, a[1]], [b[0], 0, b[1]], [a[0], 0, a[1]]);
+    pos.push(cx, y, cz, a[0], y, a[1], b[0], y, b[1]);
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
-  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
   geo.computeVertexNormals();
   return geo;
 }
-// variance: 0より大きいと、個体ごとに色相をわずかにずらす(同じ木・岩が並ぶ単調さを消す)
 function instancedFrom(geo, mat, items, variance) {
   if (!items.length) return null;
   const mesh = new THREE.InstancedMesh(geo, mat, items.length);
@@ -281,92 +282,210 @@ function hexRng(seed) {
   return (a, b) => a + next() * (b - a);
 }
 
-// 地形ごとの手続き的な模様(ノイズの染み)を描いたテクスチャ。地形ごとに1枚だけ作って使い回す
-const terrainTexCache = new Map();
-function terrainTexture(terrain) {
-  if (terrainTexCache.has(terrain)) return terrainTexCache.get(terrain);
-  const size = 256;
-  const c = document.createElement('canvas');
-  c.width = c.height = size;
-  const ctx = c.getContext('2d');
-  const base = new THREE.Color(TERRAIN_COLOR[terrain] ?? 0x446644);
-  ctx.fillStyle = `#${base.getHexString()}`;
-  ctx.fillRect(0, 0, size, size);
-  const dark = base.clone().multiplyScalar(0.72);
-  const light = base.clone().lerp(new THREE.Color(0xffffff), 0.3);
-  const blotches = terrain === 'water' || terrain === 'lake' ? 24 : 70;
-  for (let i = 0; i < blotches; i++) {
-    ctx.globalAlpha = rand(0.08, 0.2);
-    ctx.fillStyle = Math.random() < 0.5 ? `#${dark.getHexString()}` : `#${light.getHexString()}`;
-    const r = rand(6, 24);
-    ctx.beginPath();
-    ctx.ellipse(rand(0, size), rand(0, size), r, r * rand(0.5, 1), rand(0, Math.PI), 0, Math.PI * 2);
-    ctx.fill();
-  }
-  ctx.globalAlpha = 1;
-  if (terrain === 'field') { // 畝(うね)の筋
-    ctx.strokeStyle = `#${dark.getHexString()}`;
-    ctx.lineWidth = 2;
-    for (let y = -size; y < size * 2; y += 14) {
-      ctx.beginPath(); ctx.moveTo(-size, y); ctx.lineTo(size * 2, y + size); ctx.stroke();
-    }
-  } else if (terrain === 'water' || terrain === 'lake') { // さざ波の筋
-    ctx.strokeStyle = `#${light.getHexString()}`;
-    ctx.globalAlpha = 0.4; ctx.lineWidth = 2;
-    for (let y = 10; y < size; y += 20) {
-      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(size, y + rand(-6, 6)); ctx.stroke();
-    }
-    ctx.globalAlpha = 1;
-  } else if (terrain === 'mountains') { // 岩の割れ目
-    ctx.strokeStyle = `#${dark.getHexString()}`;
-    ctx.lineWidth = 1.4;
-    for (let i = 0; i < 18; i++) {
-      ctx.beginPath();
-      let x = rand(0, size), y = rand(0, size);
-      ctx.moveTo(x, y);
-      for (let k = 0; k < 4; k++) { x += rand(-20, 20); y += rand(-20, 20); ctx.lineTo(x, y); }
-      ctx.stroke();
-    }
-  } else if (terrain === 'gold') { // きらめき
-    ctx.fillStyle = '#fff6c8';
-    for (let i = 0; i < 30; i++) {
-      ctx.globalAlpha = rand(0.3, 0.8);
-      ctx.beginPath(); ctx.arc(rand(0, size), rand(0, size), rand(1, 2.6), 0, Math.PI * 2); ctx.fill();
-    }
-    ctx.globalAlpha = 1;
-  }
-  const tex = new THREE.CanvasTexture(c);
-  tex.colorSpace = THREE.SRGBColorSpace;
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  terrainTexCache.set(terrain, tex);
-  return tex;
+// ================================================================
+// ノイズ(値ノイズ+fbm)。外部ライブラリを足さず、島の起伏・海岸線のゆらぎに使う分だけの小さな実装。
+// ================================================================
+function hash2(ix, iz, seed) {
+  let h = (ix * 374761393 + iz * 668265263 + seed * 982451653) | 0;
+  h = (h ^ (h >>> 13)) * 1274126177;
+  h = h ^ (h >>> 16);
+  return ((h >>> 0) / 4294967295) * 2 - 1;
 }
-// 実写テクスチャ(diffuse + 法線)を地形ごとに1回だけ読み込んで使い回す。
-// タイル1枚の一辺はSCALE基準で一定なので、繰り返し回数も地形種類に関係なく固定でよい。
-const PHOTO_REPEAT = 1.6;
-const photoLoader = new THREE.TextureLoader();
-const photoTexCache = new Map();
-function loadPhotoTex(url) {
-  const tex = photoLoader.load(url);
+function valueNoise2(x, z, seed) {
+  const xi = Math.floor(x), zi = Math.floor(z);
+  const xf = x - xi, zf = z - zi;
+  const v00 = hash2(xi, zi, seed), v10 = hash2(xi + 1, zi, seed);
+  const v01 = hash2(xi, zi + 1, seed), v11 = hash2(xi + 1, zi + 1, seed);
+  const sx = xf * xf * (3 - 2 * xf), sz = zf * zf * (3 - 2 * zf);
+  const a = v00 + (v10 - v00) * sx, b = v01 + (v11 - v01) * sx;
+  return a + (b - a) * sz;
+}
+function fbm(x, z, seed, freq, oct, lac, gain) {
+  lac = lac ?? 2; gain = gain ?? 0.5;
+  let amp = 1, f = freq, sum = 0, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    sum += valueNoise2(x * f, z * f, seed + i * 101) * amp;
+    norm += amp;
+    amp *= gain; f *= lac;
+  }
+  return norm ? sum / norm : 0;
+}
+// 尾根状(山の険しい岩肌)。0(谷)〜1(鋭い尾根)
+function ridged(x, z, seed, freq, oct) {
+  let amp = 1, f = freq, sum = 0, norm = 0;
+  for (let i = 0; i < oct; i++) {
+    sum += (1 - Math.abs(valueNoise2(x * f, z * f, seed + i * 131))) * amp;
+    norm += amp;
+    amp *= 0.5; f *= 2;
+  }
+  return norm ? sum / norm : 0;
+}
+// 海岸線をゆらす共通のノイズ場(波長は数マス分)。水マスの判定境界だけに足し、陸マス同士の境目は揺らさない
+function coastNoise(x, z) { return fbm(x, z, 0.0055, 999, 2); }
+
+// 地形ごとの起伏の形(マス中心からの高さの上積み。境界では減衰させてから足す)
+// 振幅と周波数の積(≒傾き)を抑えめにして、地形ごとに狙った傾斜になるようにする。
+// 山だけ故意に急(尾根・崖)にし、ほかは「斜面の角度で岩肌に切り替える」判定にあまり掛からない程度にする。
+function terrainBump(terrain, x, z, seed) {
+  const island = fbm(x, z, 0.0035, 42, 2) * 5; // 島全体を通る緩いうねり(マスをまたぐ大きな起伏)
+  switch (terrain) {
+    case 'forest': return island + fbm(x, z, 0.012, seed, 3) * 5 + fbm(x, z, 0.045, seed + 50, 2) * 1.3;
+    case 'pasture': return island + fbm(x, z, 0.011, seed, 2) * 2.6;
+    case 'field': return island + fbm(x, z, 0.009, seed, 2) * 1.4;
+    case 'hills': return island + fbm(x, z, 0.013, seed, 3) * 7;
+    case 'mountains': return island + ridged(x, z, seed, 0.016, 4) * 46 + 20;
+    case 'desert': {
+      const a = 0.4, rx = x * Math.cos(a) - z * Math.sin(a);
+      return island + Math.sin(rx * 0.02 + seed) * 2.6 + fbm(x, z, 0.035, seed + 7, 2) * 1.1;
+    }
+    default: return island + fbm(x, z, 0.015, seed, 2) * 2.5; // gold/castle/pitch/lake/fogなど拡張の特殊地形
+  }
+}
+
+// ================================================================
+// 地形フィールド: hex配置から、任意の(x,z)の高さ・地形・材質ブレンド係数を求める準備をする。
+// マス中心ほど地形らしさ(起伏)を強め、境目(アポセム付近)はLAND_BASE寄りに減衰させてなじませる。
+// 水マスは、陸にいちばん近いマスからの距離で「渚のすぐ沖は浅く、沖は深く」を作る。
+// 海岸線は、水マス側の判定距離だけにノイズを足して不規則にする(陸マス同士の境目はそのまま)。
+// ================================================================
+function buildTerrainField(g) {
+  const hexes = g.hexes;
+  const centers = hexes.map((h) => { const [cx, cz] = hexCenterOf(g, h); return { cx, cz }; });
+  const isWater = hexes.map((h) => WATER_LIKE.has(h.terrain));
+  const seed = hexes.map((h) => h.id * 2654435761 % 100000);
+  // 陸マスのうち、水マス(または盤の外周=hexIds.length===1の辺)に接するものは「海岸」として渚の高さへ減衰させる
+  const coastal = hexes.map((h, i) => {
+    if (isWater[i]) return false;
+    return (h.edgeIds || []).some((eId) => {
+      const e = g.edges[eId];
+      return e.hexIds.length < 2 || e.hexIds.some((hid) => WATER_LIKE.has(g.hexes[hid].terrain));
+    });
+  });
+  const coastStyle = hexes.map((h, i) => (coastal[i] ? (hexRng(h.id * 131 + 7)(0, 1) < 0.72 ? 'beach' : 'cliff') : 'beach'));
+  return { hexes, centers, isWater, seed, coastal, coastStyle };
+}
+
+// (height, terrainIdxForMaterial) を返す。terrainIdxForMaterialは地形メッシュの材質グループ分けに使う
+function sampleTerrain(field, x, z) {
+  const { hexes, centers, isWater, seed, coastal, coastStyle } = field;
+  let bestI = -1, bestD = Infinity;
+  const jitter = coastNoise(x, z); // -1..1。水マスの距離だけをこれで揺らし、海岸線を不規則にする
+  for (let i = 0; i < hexes.length; i++) {
+    const c = centers[i];
+    let d = Math.hypot(x - c.cx, z - c.cz);
+    if (isWater[i]) d -= jitter * HEX_A * 0.38;
+    if (d < bestD) { bestD = d; bestI = i; }
+  }
+  const hex = hexes[bestI];
+  if (isWater[bestI]) {
+    // 陸にいちばん近い点までの距離(ジッターなし)で浅瀬/沖を決める
+    let nearestLand = Infinity;
+    for (let i = 0; i < hexes.length; i++) {
+      if (isWater[i]) continue;
+      nearestLand = Math.min(nearestLand, Math.hypot(x - centers[i].cx, z - centers[i].cz));
+    }
+    const shoreDist = Math.max(0, nearestLand - HEX_A);
+    const depthFactor = smoothstep(0, HEX_A * 1.6, shoreDist);
+    const h = lerp(SHELF, SEABED, depthFactor) + fbm(x, z, 0.02, 500, 2) * 2.5;
+    return { height: h, hex, terrain: hex.terrain, isWater: true };
+  }
+  const r = bestD / HEX_A;
+  const core = 1 - smoothstep(BOUNDARY_LO, BOUNDARY_HI, r); // 1:マス中心 → 0:境目
+  const bump = terrainBump(hex.terrain, x, z, seed[bestI]);
+  let boundaryTarget = LAND_BASE;
+  let beachCoast = false;
+  if (coastal[bestI]) {
+    const style = coastStyle[bestI];
+    if (style === 'cliff') {
+      const rt = smoothstep(0.62, 1.0, r); // 崖: 急に落ちる(斜面判定で岩肌になってよい、むしろ狙い)
+      boundaryTarget = lerp(LAND_BASE, -13, Math.pow(rt, 2.2));
+    } else {
+      // 砂浜: 傾斜がゆるくなるよう、広い範囲でなだらかに渚へ落とす(急だと岩肌判定に化けてしまう)
+      const rt = smoothstep(0.42, 1.3, r);
+      boundaryTarget = lerp(LAND_BASE, SHELF, rt);
+      beachCoast = rt > 0.08;
+    }
+  }
+  const h = LAND_BASE + bump * core + (boundaryTarget - LAND_BASE) * (1 - core);
+  return { height: h, hex, terrain: hex.terrain, isWater: false, core, beachCoast };
+}
+
+// マス中心の高さ(小物を置く基準の高さ)。地形メッシュを作るたびに作り直す
+function computeHexHeights(g, field) {
+  const map = new Map();
+  g.hexes.forEach((hex) => {
+    const [cx, cz] = hexCenterOf(g, hex);
+    if (WATER_LIKE.has(hex.terrain)) { map.set(hex.id, SEA_LEVEL); return; }
+    map.set(hex.id, sampleTerrain(field, cx, cz).height);
+  });
+  return map;
+}
+
+// ================================================================
+// 地形テクスチャの読み込み(CC0のPBR一式。色・法線・ARM=AO/粗さ/金属度をまとめた1枚)
+// ================================================================
+const texLoader = new THREE.TextureLoader();
+const terrainTexCache = new Map();
+function loadTerrainTex(path, isColor) {
+  const tex = texLoader.load(path);
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(PHOTO_REPEAT, PHOTO_REPEAT);
+  if (isColor) tex.colorSpace = THREE.SRGBColorSpace;
   if (renderer) tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
   return tex;
 }
-function photoTerrainTextures(terrain) {
-  if (photoTexCache.has(terrain)) return photoTexCache.get(terrain);
-  const base = TERRAIN_PHOTO[terrain];
-  const out = { normalMap: loadPhotoTex(base.replace(/(\.jpg)$/, '_nor$1')) };
-  photoTexCache.set(terrain, out);
+function terrainTextures(name) {
+  if (terrainTexCache.has(name)) return terrainTexCache.get(name);
+  const out = {
+    map: loadTerrainTex(`./textures/${name}_diff.jpg`, true),
+    normalMap: loadTerrainTex(`./textures/${name}_nor.jpg`, false),
+    arm: loadTerrainTex(`./textures/${name}_arm.jpg`, false), // R=AO, G=粗さ, B=金属度(Poly Havenの標準パック)
+  };
+  terrainTexCache.set(name, out);
   return out;
 }
-function getTerrainMaterial(terrain) {
-  if (TERRAIN_MAT[terrain]) return TERRAIN_MAT[terrain];
+// スケール違いの2層(1枚目をそのまま、2枚目は少し拡大+オフセット)をワールド座標のノイズでずらし混ぜ、
+// 同じ模様の繰り返しが目立たないようにする(map_fragmentだけ差し替え。法線/ARMは単純タイリングのまま)。
+function addDetailBlend(material) {
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPosDetail;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWorldPosDetail = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPosDetail;\nfloat detailHash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }')
+      .replace('#include <map_fragment>', `
+      {
+        vec2 uvA = vMapUv;
+        vec2 uvB = vMapUv * 2.63 + vec2(17.0, 31.0);
+        float n = detailHash(floor(vWorldPosDetail.xz * 0.04));
+        vec4 sampledA = texture2D( map, uvA );
+        vec4 sampledB = texture2D( map, uvB );
+        vec4 sampledDiffuseColor = mix( sampledA, sampledB, smoothstep(0.35, 0.65, n) );
+        #ifdef DECODE_VIDEO_TEXTURE
+          sampledDiffuseColor = sRGBTransferEOTF( sampledDiffuseColor );
+        #endif
+        diffuseColor *= sampledDiffuseColor;
+      }`);
+  };
+}
+function getTerrainMaterial(name, repeat) {
+  if (TERRAIN_MAT[name]) return TERRAIN_MAT[name];
+  const tx = terrainTextures(name);
+  [tx.map, tx.normalMap, tx.arm].forEach((t) => t.repeat.set(repeat, repeat));
   const mat = new THREE.MeshStandardMaterial({
-    map: terrainTexture(terrain), roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
-    ...(TERRAIN_PHOTO[terrain] && { normalMap: photoTerrainTextures(terrain).normalMap }),
+    map: tx.map, normalMap: tx.normalMap, aoMap: tx.arm, roughnessMap: tx.arm, metalnessMap: tx.arm,
+    roughness: 1, metalness: 0.15, vertexColors: true,
   });
-  TERRAIN_MAT[terrain] = mat;
+  addDetailBlend(mat);
+  TERRAIN_MAT[name] = mat;
+  return mat;
+}
+// 海底(水マスの地形。ほとんど海に隠れるが、渚の近くは海越しにうっすら見える)
+function getSeabedMaterial() {
+  if (TERRAIN_MAT.seabed) return TERRAIN_MAT.seabed;
+  const tx = terrainTextures('desert'); // 砂の法線だけ借りる(色は塗りつぶしで海底らしい暗さにする)
+  const mat = new THREE.MeshStandardMaterial({ color: 0x1f4650, normalMap: tx.normalMap, roughness: 0.95, vertexColors: true });
+  mat.normalMap.repeat.set(3, 3);
+  TERRAIN_MAT.seabed = mat;
   return mat;
 }
 
@@ -394,13 +513,193 @@ function numberTexture(n, hot) {
 }
 
 // ================================================================
-// 本体: 盤を1枚まるごと作り直す
+// 地形メッシュ本体: 盤を覆う矩形の細かいグリッドを作り、各頂点の高さ・材質を決めて、
+// 地形ごとにジオメトリグループへ振り分ける(1メッシュ・材質配列、描画はグループ単位)。
+// 斜面(法線がかなり横向き)は、地形に関わらず岩肌(mountains)の材質に差し替える。
+// ================================================================
+function buildTerrainMesh(g, field) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  field.centers.forEach(({ cx, cz }) => {
+    minX = Math.min(minX, cx - HEX_R * 1.15); maxX = Math.max(maxX, cx + HEX_R * 1.15);
+    minZ = Math.min(minZ, cz - HEX_R * 1.15); maxZ = Math.max(maxZ, cz + HEX_R * 1.15);
+  });
+  let cell = Q.cell;
+  let nx = Math.min(Q.maxGrid, Math.ceil((maxX - minX) / cell)) + 1;
+  let nz = Math.min(Q.maxGrid, Math.ceil((maxZ - minZ) / cell)) + 1;
+  cell = Math.max((maxX - minX) / (nx - 1), (maxZ - minZ) / (nz - 1)); // 矩形がmaxGridを超えるときは格子を粗くする
+
+  const count = nx * nz;
+  const pos = new Float32Array(count * 3);
+  const uv = new Float32Array(count * 2);
+  const color = new Float32Array(count * 3);
+  const terrainOf = new Array(count); // 地形名(材質の振り分けに使う。後で斜面判定により上書きすることがある)
+  const beachOf = new Array(count); // 砂浜の渚への下り(急だが岩肌にはしたくない)かどうか
+  const UV_SCALE = 1 / (HEX_A * 1.1);
+
+  for (let j = 0; j < nz; j++) {
+    for (let i = 0; i < nx; i++) {
+      const x = minX + i * cell, z = minZ + j * cell;
+      const s = sampleTerrain(field, x, z);
+      const k = j * nx + i;
+      pos[k * 3] = x; pos[k * 3 + 1] = s.height; pos[k * 3 + 2] = z;
+      uv[k * 2] = x * UV_SCALE; uv[k * 2 + 1] = z * UV_SCALE;
+      const shade = s.isWater ? 1 : lerp(0.82, 1.0, s.core ?? 1); // マスの境目をわずかに暗く落として縫い目をなじませる
+      color[k * 3] = color[k * 3 + 1] = color[k * 3 + 2] = shade;
+      terrainOf[k] = s.isWater ? 'seabed' : (TERRAIN_SET[s.terrain] ? s.terrain : 'pasture');
+      beachOf[k] = !!s.beachCoast;
+    }
+  }
+  const index = [];
+  for (let j = 0; j < nz - 1; j++) {
+    for (let i = 0; i < nx - 1; i++) {
+      const a = j * nx + i, b = a + 1, c = a + nx, d = c + 1;
+      index.push(a, c, b, b, c, d);
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  geo.setAttribute('uv2', new THREE.BufferAttribute(uv, 2)); // aoMapはuv2を読むため(同じ座標でよい)
+  geo.setAttribute('color', new THREE.BufferAttribute(color, 3));
+
+  // 三角形ごとの地形を、2頂点以上一致する方を採用して決め、斜面はmountains(岩肌)に差し替える
+  const triTerrain = [];
+  const up = new THREE.Vector3(0, 1, 0);
+  const pA = new THREE.Vector3(), pB = new THREE.Vector3(), pC = new THREE.Vector3(), eAB = new THREE.Vector3(), eAC = new THREE.Vector3(), fn = new THREE.Vector3();
+  for (let t = 0; t < index.length; t += 3) {
+    const ia = index[t], ib = index[t + 1], ic = index[t + 2];
+    pA.set(pos[ia * 3], pos[ia * 3 + 1], pos[ia * 3 + 2]);
+    pB.set(pos[ib * 3], pos[ib * 3 + 1], pos[ib * 3 + 2]);
+    pC.set(pos[ic * 3], pos[ic * 3 + 1], pos[ic * 3 + 2]);
+    eAB.subVectors(pB, pA); eAC.subVectors(pC, pA);
+    fn.crossVectors(eAB, eAC).normalize();
+    const steep = fn.angleTo(up) > (QUALITY === 'high' ? 0.55 : 0.62); // ラジアン(約32〜35度)を超える斜面
+    let terrain = terrainOf[ia];
+    const isBeach = beachOf[ia] && beachOf[ib] && beachOf[ic];
+    if (terrain !== 'seabed' && steep && terrain !== 'mountains' && !isBeach) terrain = 'mountains';
+    if (isBeach && terrain !== 'seabed') terrain = 'desert'; // 砂浜は渚まで傾斜があっても砂のまま(岩肌にしない)
+    triTerrain.push(terrain);
+  }
+  // 材質ごとにインデックスをまとめ直し、geometry.groupsで1描画ずつに分ける
+  const byTerrain = new Map();
+  triTerrain.forEach((terrain, ti) => {
+    if (!byTerrain.has(terrain)) byTerrain.set(terrain, []);
+    byTerrain.get(terrain).push(index[ti * 3], index[ti * 3 + 1], index[ti * 3 + 2]);
+  });
+  const newIndex = [];
+  const materials = [];
+  let groupStart = 0;
+  [...byTerrain.keys()].forEach((terrain, gi) => {
+    const idxs = byTerrain.get(terrain);
+    newIndex.push(...idxs);
+    geo.addGroup(groupStart, idxs.length, gi);
+    groupStart += idxs.length;
+    materials.push(terrain === 'seabed' ? getSeabedMaterial() : getTerrainMaterial(terrain, 5));
+  });
+  geo.setIndex(newIndex);
+  geo.computeVertexNormals();
+
+  const mesh = new THREE.Mesh(geo, materials);
+  mesh.receiveShadow = true;
+  mesh.castShadow = true;
+  return mesh;
+}
+
+// ================================================================
+// 海: 地形メッシュの外側まで広がる1枚の板。深さ(渚との距離)で浅瀬エメラルド→沖の濃紺に変え、
+// 岸の近くに白い泡、ごく浅いところは地形メッシュ(海底)がうっすら透ける。
+// three.jsのWater.js(ミラー反射)は毎フレームの2回描画が重く、深さの色分けにも向かないため、
+// 自前のShaderMaterialにする(ブリーフにある代替案のとおり)。
+// ================================================================
+function buildOcean(g, field) {
+  let maxR = 0;
+  field.centers.forEach(({ cx, cz }) => { maxR = Math.max(maxR, Math.hypot(cx, cz) + HEX_R); });
+  const size = maxR * 8; // 地平線まで続くように、盤よりずっと大きい板にする
+  const seg = 180;
+  const geo = new THREE.PlaneGeometry(size, size, seg, seg);
+  geo.rotateX(-Math.PI / 2);
+
+  const uniforms = {
+    uTime: { value: 0 },
+    uShallow: { value: new THREE.Color(0x2fb896) }, // 浅瀬エメラルド
+    uDeep: { value: new THREE.Color(0x0a2f52) }, // 沖の濃紺
+    uFoam: { value: new THREE.Color(0xf3fbff) },
+    uSunDir: { value: new THREE.Vector3(260, 480, 180).normalize() },
+  };
+  oceanUniforms = uniforms;
+  const mat = new THREE.MeshStandardMaterial({ color: 0x1a4a66, roughness: 0.25, metalness: 0.05, dithering: true });
+  mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, uniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform float uTime;\nvarying vec3 vWorldPosOcean;')
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        float wA = sin((position.x + position.z) * 0.012 + uTime * 0.7) * 1.6;
+        float wB = sin((position.x * 0.9 - position.z * 1.3) * 0.02 - uTime * 1.1) * 0.9;
+        transformed.y += wA + wB;
+        vWorldPosOcean = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
+    shader.fragmentShader = shader.fragmentShader
+      .replace('#include <common>', `#include <common>
+        uniform vec3 uShallow; uniform vec3 uDeep; uniform vec3 uFoam; uniform float uTime;
+        varying vec3 vWorldPosOcean;`)
+      .replace('#include <map_fragment>', `
+        {
+          // 渚からの距離が分からないので、原点(島)からの距離を目安の深さにする(簡易版)。
+          // ponytail: hexごとの本当の渚からの距離ではないため、島に近いマスほど実際より広く浅瀬色が伸びる。
+          // ちゃんと渚までの距離を使うなら、地形メッシュの高さマップをテクスチャに焼いて渡す(②以降の候補)。
+          float distFromCenter = length(vWorldPosOcean.xz);
+          float depth = smoothstep(${(maxR * 0.8).toFixed(1)}, ${(maxR * 2.3).toFixed(1)}, distFromCenter);
+          vec3 base = mix(uShallow, uDeep, depth);
+          // 渚のすぐそば(depthがほぼ0)だけ、なめらかに白く明るませて泡の気配にする(硬いノイズは使わない)
+          float shallowEdge = 1.0 - smoothstep(0.0, 0.1, depth);
+          float shimmer = 0.75 + 0.25 * sin(vWorldPosOcean.x * 0.05 + vWorldPosOcean.z * 0.07 + uTime * 1.2);
+          base = mix(base, uFoam, shallowEdge * 0.35 * shimmer);
+          diffuseColor.rgb *= base;
+        }`);
+  };
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.receiveShadow = false; // 平らな板に浅い角度の太陽光があたるとシャドウマップのちらつき(アクネ)が出るため。影の質は②で詰める
+  mesh.position.y = SEA_LEVEL;
+  return mesh;
+}
+
+function disposeDeep(obj) {
+  if (!obj) return;
+  obj.traverse((o) => {
+    if (o.geometry) o.geometry.dispose();
+  });
+}
+function boardSig(g) { return g.hexes.length + ':' + g.hexes.map((h) => h.terrain[0] + h.q + ',' + h.r).join('|'); }
+
+function rebuildTerrainAndOcean(g) {
+  if (terrainGroup) { scene.remove(terrainGroup); disposeDeep(terrainGroup); }
+  if (oceanMesh) { scene.remove(oceanMesh); disposeDeep(oceanMesh); }
+  const field = buildTerrainField(g);
+  hexHeight = computeHexHeights(g, field);
+  terrainGroup = buildTerrainMesh(g, field);
+  scene.add(terrainGroup);
+  oceanMesh = buildOcean(g, field);
+  scene.add(oceanMesh);
+}
+
+// hexの基準の高さ(ships/portsはいつも海面、陸は地形メッシュのマス中心の高さ)
+function baseYOfHex(hex) {
+  if (!hex) return LAND_BASE;
+  if (WATER_LIKE.has(hex.terrain)) return SEA_LEVEL;
+  return hexHeight.get(hex.id) ?? LAND_BASE;
+}
+function firstHexAt(g, ids) { return ids.map((id) => g.hexes[id]).find(Boolean); }
+
+// ================================================================
+// 本体: 盤を1枚まるごと作り直す(地形と海は形が変わったときだけ)
 // ================================================================
 export function renderBoard3D(game, uiState, overlay) {
   if (!scene) return;
-  disposeGroup(sceneGroup);
-  hitTargets = []; waterMeshes = []; pulseMeshes = [];
   const g = game.board;
+  const sig = boardSig(g);
+  if (sig !== boardSignature) { boardSignature = sig; rebuildTerrainAndOcean(g); }
+
+  disposeGroup(sceneGroup);
+  hitTargets = []; pulseMeshes = [];
 
   frameCamera(g);
 
@@ -409,19 +708,11 @@ export function renderBoard3D(game, uiState, overlay) {
 
   g.hexes.forEach((hex) => {
     const [cx, cz] = hexCenterOf(g, hex);
-    const pts = hexPointsOf(g, hex);
-    const terrain = hex.fog ? 'fog' : hex.terrain;
-    const height = TERRAIN_HEIGHT[terrain] ?? 10;
-    const tile = new THREE.Mesh(hexPrismGeometry(pts, height), getTerrainMaterial(terrain));
-    tile.receiveShadow = true; tile.castShadow = false;
-    sceneGroup.add(tile);
-    if (terrain === 'water' || terrain === 'lake') {
-      tile.userData.baseY = 0;
-      waterMeshes.push(tile);
-    }
+    const height = baseYOfHex(hex);
     const R = SCALE * 0.6;
     // 同じマスは再描画のたびに木・岩の並びが変わらないよう、hex.idを種にした専用の乱数を使う
     const rr = hexRng(hex.id * 7919 + 13);
+    const terrain = hex.fog ? 'fog' : hex.terrain;
     if (terrain === 'forest') {
       const n = Math.floor(rr(4, 6));
       for (let i = 0; i < n; i++) {
@@ -473,7 +764,7 @@ export function renderBoard3D(game, uiState, overlay) {
       addPitch(cx, cz, height);
     } else if (terrain === 'fog') {
       const dome = new THREE.Mesh(new THREE.SphereGeometry(R * 0.95, 10, 6, 0, Math.PI * 2, 0, Math.PI / 2),
-        new THREE.MeshStandardMaterial({ color: 0xdfe8e2, transparent: true, opacity: 0.55, flatShading: true }));
+        new THREE.MeshStandardMaterial({ color: 0xdfe8e2, transparent: true, opacity: 0.55 }));
       dome.position.set(cx, height, cz);
       sceneGroup.add(dome);
     }
@@ -483,7 +774,6 @@ export function renderBoard3D(game, uiState, overlay) {
     }
     if (hex.number2 != null) addNumberChip(cx + 24, cz - 16, height, hex.number2, false, 0.6);
   });
-  if (g.lakeNumbers) { /* 漁師の湖は lake terrain 側で既に扱う簡略版（4隅の出目は省略） */ }
 
   [
     instancedFrom(GEO.trunk, MAT.bark, treeItems, 0.02),
@@ -509,7 +799,7 @@ export function renderBoard3D(game, uiState, overlay) {
       const mat = new THREE.MeshStandardMaterial({ color: 0x2a93ad, transparent: true, opacity: 0.85 });
       const len = Math.hypot((v2.x - v1.x) * SCALE, (v2.y - v1.y) * SCALE);
       const band = new THREE.Mesh(new THREE.BoxGeometry(len, 1, 10), mat);
-      band.position.set((v1.x + v2.x) / 2 * SCALE, 1, (v1.y + v2.y) / 2 * SCALE);
+      band.position.set((v1.x + v2.x) / 2 * SCALE, SEA_LEVEL + 1, (v1.y + v2.y) / 2 * SCALE);
       band.rotation.y = -Math.atan2((v2.y - v1.y) * SCALE, (v2.x - v1.x) * SCALE);
       sceneGroup.add(band);
     });
@@ -521,15 +811,14 @@ export function renderBoard3D(game, uiState, overlay) {
     const x1 = v1.x * SCALE, z1 = v1.y * SCALE, x2 = v2.x * SCALE, z2 = v2.y * SCALE;
     const mx = (x1 + x2) / 2, mz = (z1 + z2) / 2;
     const ang = -Math.atan2(z2 - z1, x2 - x1);
-    const hexAtEdge = edge.hexIds.map((id) => g.hexes[id]).find(Boolean);
-    const baseY = hexAtEdge ? (TERRAIN_HEIGHT[hexAtEdge.fog ? 'fog' : hexAtEdge.terrain] ?? 10) : 4;
+    const baseY = baseYOfHex(firstHexAt(g, edge.hexIds));
     if (edge.ship != null) {
       addShip(mx, mz, ang, game.players[edge.ship].color);
     } else if (edge.road != null) {
       const color = new THREE.Color(game.players[edge.road].color);
       const len = Math.hypot(x2 - x1, z2 - z1) * 0.82;
-      // 角を落とした木の棒(断面が七角形の丸太)。GEO.roadは長さ1なので、scale.yで伸ばしてから横向きに倒す
-      const road = new THREE.Mesh(GEO.road, new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.85 }));
+      // 角を落とした木の棒(断面が八角形の丸太)。GEO.roadは長さ1なので、scale.yで伸ばしてから横向きに倒す
+      const road = new THREE.Mesh(GEO.road, new THREE.MeshStandardMaterial({ color, roughness: 0.85 }));
       road.scale.set(1, len, 1);
       const qLay = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2);
       const qTurn = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), ang);
@@ -544,8 +833,7 @@ export function renderBoard3D(game, uiState, overlay) {
   g.vertices.forEach((v) => {
     if (!v.building) return;
     const x = v.x * SCALE, z = v.y * SCALE;
-    const hexAtV = v.hexIds.map((id) => g.hexes[id]).find(Boolean);
-    const baseY = hexAtV ? (TERRAIN_HEIGHT[hexAtV.fog ? 'fog' : hexAtV.terrain] ?? 10) : 4;
+    const baseY = baseYOfHex(firstHexAt(g, v.hexIds));
     const color = new THREE.Color(game.players[v.building.owner].color);
     if (v.building.type === 'city') addCity(x, baseY, z, color); else addHouse(x, baseY, z, color);
   });
@@ -554,8 +842,7 @@ export function renderBoard3D(game, uiState, overlay) {
   if (game.players[0] && game.players[0].knights) {
     game.players.forEach((pl) => (pl.knights || []).forEach((k) => {
       const v = g.vertices[k.vertexId];
-      const hexAtV = v.hexIds.map((id) => g.hexes[id]).find(Boolean);
-      const baseY = hexAtV ? (TERRAIN_HEIGHT[hexAtV.fog ? 'fog' : hexAtV.terrain] ?? 10) : 4;
+      const baseY = baseYOfHex(firstHexAt(g, v.hexIds));
       addKnight(v.x * SCALE, baseY, v.y * SCALE, pl.color, k.active);
     }));
   }
@@ -563,19 +850,18 @@ export function renderBoard3D(game, uiState, overlay) {
     game.players.forEach((pl) => (pl.warKnights || []).forEach((k) => {
       const e = g.edges[k.edgeId];
       const v1 = g.vertices[e.v1], v2 = g.vertices[e.v2];
-      addKnight((v1.x + v2.x) / 2 * SCALE, 10, (v1.y + v2.y) / 2 * SCALE, pl.color, true);
+      addKnight((v1.x + v2.x) / 2 * SCALE, LAND_BASE, (v1.y + v2.y) / 2 * SCALE, pl.color, true);
     }));
   }
 
   // 盗賊・海賊
   if (g.robberHex != null) {
     const [cx, cz] = hexCenterOf(g, g.hexes[g.robberHex]);
-    const h = TERRAIN_HEIGHT[g.hexes[g.robberHex].terrain] ?? 10;
-    addRobber(cx, h, cz, uiState && (uiState.mode === 'moveRobber' || uiState.mode === 'devKnightHex'));
+    addRobber(cx, baseYOfHex(g.hexes[g.robberHex]), cz, uiState && (uiState.mode === 'moveRobber' || uiState.mode === 'devKnightHex'));
   }
   if (g.pirateHex != null) {
     const [cx, cz] = hexCenterOf(g, g.hexes[g.pirateHex]);
-    addPirate(cx, TERRAIN_HEIGHT.water, cz, uiState && (uiState.mode === 'moveRobber' || uiState.mode === 'devKnightHex'));
+    addPirate(cx, SEA_LEVEL, cz, uiState && (uiState.mode === 'moveRobber' || uiState.mode === 'devKnightHex'));
   }
 
   // ---- 置ける場所など、overlay に入っている当たり判定をそのまま光る的にする ----
@@ -586,7 +872,7 @@ export function renderBoard3D(game, uiState, overlay) {
 
 function disposeGroup(group) {
   group.traverse((o) => {
-    if (o.geometry && o.geometry !== GEO.trunk && !Object.values(GEO).includes(o.geometry)) o.geometry.dispose();
+    if (o.geometry && !Object.values(GEO).includes(o.geometry)) o.geometry.dispose();
     const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
     mats.forEach((m) => { if (!Object.values(MAT).includes(m) && !Object.values(TERRAIN_MAT).includes(m)) m.dispose(); });
   });
@@ -634,21 +920,21 @@ function addPort(g, eId) {
   const isAny = type === '3:1';
   const color = isAny ? 0xf0e4bc : (RES_COLOR3D[type] ?? 0xcccccc);
   [v1, v2].forEach((v) => {
-    const pole = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.4, 10, 6), new THREE.MeshStandardMaterial({ color: 0x6e5436, flatShading: true }));
-    pole.position.set(v.x * SCALE, 5, v.y * SCALE);
+    const pole = new THREE.Mesh(new THREE.CylinderGeometry(1.4, 1.4, 10, 6), new THREE.MeshStandardMaterial({ color: 0x6e5436 }));
+    pole.position.set(v.x * SCALE, SEA_LEVEL + 5, v.y * SCALE);
     sceneGroup.add(pole);
   });
-  const raft = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 3, 10), new THREE.MeshStandardMaterial({ color, flatShading: true }));
-  raft.position.set(px, 3, pz);
+  const raft = new THREE.Mesh(new THREE.CylinderGeometry(16, 16, 3, 10), new THREE.MeshStandardMaterial({ color }));
+  raft.position.set(px, SEA_LEVEL + 3, pz);
   raft.castShadow = true;
   sceneGroup.add(raft);
 }
 
 function addCastle(cx, cz, height) {
-  const tower = new THREE.Mesh(new THREE.CylinderGeometry(16, 20, 34, 8), new THREE.MeshStandardMaterial({ color: 0x8b8f99, flatShading: true }));
+  const tower = new THREE.Mesh(new THREE.CylinderGeometry(16, 20, 34, 8), new THREE.MeshStandardMaterial({ color: 0x8b8f99 }));
   tower.position.set(cx, height + 17, cz);
   tower.castShadow = true;
-  const roof = new THREE.Mesh(new THREE.ConeGeometry(20, 16, 8), new THREE.MeshStandardMaterial({ color: 0x5a3a2a, flatShading: true }));
+  const roof = new THREE.Mesh(new THREE.ConeGeometry(20, 16, 8), new THREE.MeshStandardMaterial({ color: 0x5a3a2a }));
   roof.position.set(cx, height + 42, cz);
   sceneGroup.add(tower, roof);
 }
@@ -665,22 +951,22 @@ function addPitch(cx, cz, height) {
 }
 
 function addShip(mx, mz, ang, playerColor) {
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(18, 5, 7), new THREE.MeshStandardMaterial({ color: 0x4a3420, flatShading: true }));
-  hull.position.set(mx, TERRAIN_HEIGHT.water + 2.5, mz);
+  const hull = new THREE.Mesh(new THREE.BoxGeometry(18, 5, 7), new THREE.MeshStandardMaterial({ color: 0x4a3420 }));
+  hull.position.set(mx, SEA_LEVEL + 2.5, mz);
   hull.rotation.y = ang;
-  const sail = new THREE.Mesh(new THREE.ConeGeometry(6, 12, 3), new THREE.MeshStandardMaterial({ color: new THREE.Color(playerColor), flatShading: true }));
+  const sail = new THREE.Mesh(new THREE.ConeGeometry(6, 12, 3), new THREE.MeshStandardMaterial({ color: new THREE.Color(playerColor) }));
   sail.rotation.y = ang;
   sail.rotation.z = Math.PI / 2;
-  sail.position.set(mx, TERRAIN_HEIGHT.water + 9, mz);
+  sail.position.set(mx, SEA_LEVEL + 9, mz);
   hull.castShadow = true; sail.castShadow = true;
   sceneGroup.add(hull, sail);
 }
 
 // 家: 土台(石)・壁・軒(屋根の張り出し)・屋根の4段。軒は壁より少し広い板を45度回し、角を庇のように張り出す
 function addHouse(x, baseY, z, color) {
-  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), flatShading: true, roughness: 0.95 });
-  const wallMat = new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.8 });
-  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), flatShading: true, roughness: 0.75 });
+  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), roughness: 0.95 });
+  const wallMat = new THREE.MeshStandardMaterial({ color, roughness: 0.8 });
+  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), roughness: 0.75 });
   const plinth = new THREE.Mesh(new THREE.BoxGeometry(12.5, 2, 12.5), stoneMat);
   plinth.position.set(x, baseY + 1 + 1.5, z);
   const body = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 11), wallMat);
@@ -695,9 +981,9 @@ function addHouse(x, baseY, z, color) {
 }
 // 都市: 土台・基部・塔・塔の軒・屋根。基部と塔はどちらも面取り代わりに軒(張り出し)を挟む
 function addCity(x, baseY, z, color) {
-  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), flatShading: true, roughness: 0.95 });
-  const wallMat = new THREE.MeshStandardMaterial({ color, flatShading: true, roughness: 0.8 });
-  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), flatShading: true, roughness: 0.75 });
+  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), roughness: 0.95 });
+  const wallMat = new THREE.MeshStandardMaterial({ color, roughness: 0.8 });
+  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), roughness: 0.75 });
   const plinth = new THREE.Mesh(new THREE.BoxGeometry(18.5, 2, 18.5), stoneMat);
   plinth.position.set(x, baseY + 1 + 1.5, z);
   const base = new THREE.Mesh(new THREE.BoxGeometry(17, 9, 17), wallMat);
@@ -713,21 +999,21 @@ function addCity(x, baseY, z, color) {
 function addKnight(x, baseY, z, color, active) {
   const c = new THREE.Color(color);
   if (!active) c.multiplyScalar(0.55);
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 4.2, 10, 7), new THREE.MeshStandardMaterial({ color: c, flatShading: true }));
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 4.2, 10, 7), new THREE.MeshStandardMaterial({ color: c }));
   body.position.set(x, baseY + 5 + 1.5, z);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(3, 8, 6), new THREE.MeshStandardMaterial({ color: c, flatShading: true }));
+  const head = new THREE.Mesh(new THREE.SphereGeometry(3, 8, 6), new THREE.MeshStandardMaterial({ color: c }));
   head.position.set(x, baseY + 11 + 1.5, z);
   sceneGroup.add(body, head);
 }
 // 盗賊: マント(裾広がりの円錐)・肩の襟巻き(トーラス)・頭・とがり帽子のつば
 function addRobber(cx, height, cz, blink) {
-  const cloakMat = new THREE.MeshStandardMaterial({ color: 0x1c1b22, flatShading: true, roughness: 0.9 });
+  const cloakMat = new THREE.MeshStandardMaterial({ color: 0x1c1b22, roughness: 0.9 });
   const body = new THREE.Mesh(new THREE.ConeGeometry(9, 22, 8), cloakMat);
   body.position.set(cx, height + 11, cz);
   const collar = new THREE.Mesh(new THREE.TorusGeometry(5, 1.6, 6, 10), cloakMat);
   collar.rotation.x = Math.PI / 2;
   collar.position.set(cx, height + 20, cz);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(6, 8, 6), new THREE.MeshStandardMaterial({ color: 0x2d2c36, flatShading: true, roughness: 0.85 }));
+  const head = new THREE.Mesh(new THREE.SphereGeometry(6, 8, 6), new THREE.MeshStandardMaterial({ color: 0x2d2c36, roughness: 0.85 }));
   head.position.set(cx, height + 25, cz);
   const brim = new THREE.Mesh(new THREE.ConeGeometry(7, 3, 8), cloakMat);
   brim.position.set(cx, height + 29, cz);
@@ -735,14 +1021,14 @@ function addRobber(cx, height, cz, blink) {
   if (blink) addPulseRing(cx, height + 1, cz, 20, 0xffd84a);
 }
 function addPirate(cx, height, cz, blink) {
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(22, 6, 14), new THREE.MeshStandardMaterial({ color: 0x2b1d10, flatShading: true }));
+  const hull = new THREE.Mesh(new THREE.BoxGeometry(22, 6, 14), new THREE.MeshStandardMaterial({ color: 0x2b1d10 }));
   hull.position.set(cx, height + 3, cz);
   sceneGroup.add(hull);
   addRobber(cx, height + 4, cz, blink);
 }
 function addPulseRing(x, y, z, r, color) {
   const ring = new THREE.Mesh(new THREE.TorusGeometry(r, 1.6, 6, 28),
-    new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 1, flatShading: true }));
+    new THREE.MeshStandardMaterial({ color, emissive: color, emissiveIntensity: 1 }));
   ring.rotation.x = -Math.PI / 2;
   ring.position.set(x, y, z);
   ring.userData.baseScale = 1;
@@ -755,8 +1041,7 @@ function addOverlayTarget(g, o) {
   const a = o.attrs;
   if (a['data-vertex'] != null) {
     const v = g.vertices[Number(a['data-vertex'])];
-    const hexAtV = v.hexIds.map((id) => g.hexes[id]).find(Boolean);
-    const baseY = hexAtV ? (TERRAIN_HEIGHT[hexAtV.fog ? 'fog' : hexAtV.terrain] ?? 10) : 4;
+    const baseY = baseYOfHex(firstHexAt(g, v.hexIds));
     const mesh = new THREE.Mesh(new THREE.CylinderGeometry(9, 9, 3, 16),
       new THREE.MeshStandardMaterial({ color: 0xf0cf85, emissive: 0xf0cf85, emissiveIntensity: 0.6, transparent: true, opacity: 0.9 }));
     mesh.position.set(v.x * SCALE, baseY + 2, v.y * SCALE);
@@ -768,8 +1053,7 @@ function addOverlayTarget(g, o) {
     const e = g.edges[Number(a['data-edge'])];
     const v1 = g.vertices[e.v1], v2 = g.vertices[e.v2];
     const x1 = v1.x * SCALE, z1 = v1.y * SCALE, x2 = v2.x * SCALE, z2 = v2.y * SCALE;
-    const hexAtE = e.hexIds.map((id) => g.hexes[id]).find(Boolean);
-    const baseY = hexAtE ? (TERRAIN_HEIGHT[hexAtE.fog ? 'fog' : hexAtE.terrain] ?? 10) : 4;
+    const baseY = baseYOfHex(firstHexAt(g, e.hexIds));
     const len = Math.hypot(x2 - x1, z2 - z1);
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(len * 0.8, 3, 11),
       new THREE.MeshStandardMaterial({ color: 0xf0cf85, emissive: 0xf0cf85, emissiveIntensity: 0.6, transparent: true, opacity: 0.85 }));
@@ -781,11 +1065,11 @@ function addOverlayTarget(g, o) {
   } else if (a['data-hex'] != null) {
     const hex = g.hexes[Number(a['data-hex'])];
     const [cx, cz] = hexCenterOf(g, hex);
-    const height = TERRAIN_HEIGHT[hex.fog ? 'fog' : hex.terrain] ?? 10;
+    const height = baseYOfHex(hex);
     const pts = hexPointsOf(g, hex);
-    const mesh = new THREE.Mesh(hexPrismGeometry(pts.map(([x, z]) => [x, z]), 2),
+    const mesh = new THREE.Mesh(flatHexGeometry(pts.map(([x, z]) => [x - cx, z - cz]), 0),
       new THREE.MeshStandardMaterial({ color: 0xffe9a8, emissive: 0xffd84a, emissiveIntensity: 0.5, transparent: true, opacity: 0.55, side: THREE.DoubleSide }));
-    mesh.position.y = height + 1;
+    mesh.position.set(cx, height + 1, cz);
     sceneGroup.add(mesh);
     hitTargets.push({ mesh, kind: 'hex', id: hex.id });
     pulseMeshes.push(mesh);

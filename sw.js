@@ -12,7 +12,7 @@
 // PREFIX 'catan-' の前方一致に引っかかり(''catan-3d-v1'.startsWith('catan-')===true)、
 // catan 側の activate が catan-3d のキャッシュまで消してしまう。それを避けるための名前。
 const PREFIX = 'catan3d-';
-const VERSION = 'v5';
+const VERSION = 'v6';
 const CACHE = `${PREFIX}${VERSION}`;
 const FONT_CACHE = `${PREFIX}fonts`;
 
@@ -32,12 +32,24 @@ const SHELL = [
   './vendor/OrbitControls.js',
   './vendor/RoomEnvironment.js',
   './vendor/RGBELoader.js',
+  './textures/forest_diff.jpg',
   './textures/forest_nor.jpg',
+  './textures/forest_arm.jpg',
+  './textures/pasture_diff.jpg',
   './textures/pasture_nor.jpg',
+  './textures/pasture_arm.jpg',
+  './textures/field_diff.jpg',
   './textures/field_nor.jpg',
+  './textures/field_arm.jpg',
+  './textures/hills_diff.jpg',
   './textures/hills_nor.jpg',
+  './textures/hills_arm.jpg',
+  './textures/mountains_diff.jpg',
   './textures/mountains_nor.jpg',
+  './textures/mountains_arm.jpg',
+  './textures/desert_diff.jpg',
   './textures/desert_nor.jpg',
+  './textures/desert_arm.jpg',
   './textures/sky.hdr',
   './manifest.webmanifest',
   './webapp-kit/webapp-kit.css',
