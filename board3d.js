@@ -18,22 +18,23 @@ const SCALE = 66; // main.jsのSCALEと同じ値（頂点のx,yをこの倍率�
 const REDUCE_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
 // ---- 地形ごとの色・高さ（illust.jsのTERRAIN_STYLEと同じ地形名） ----
-const TERRAIN_COLOR = {
-  forest: 0x2f6a3c, pasture: 0x9fcf5e, field: 0xe2bb3f, hills: 0xb15a2f,
-  mountains: 0x8d93a0, desert: 0xe7d29a, water: 0x1f7089, gold: 0xe9c43f,
-  lake: 0x1f7089, castle: 0x747c8a, pitch: 0x2f8a3f, fog: 0x8a9690,
+const TERRAIN_COLOR = { // catan（2D）のillust.jsのグラデーション2色の中間
+  forest: 0x40854b, pasture: 0xa0cc6f, field: 0xe4be56, hills: 0xc97448,
+  mountains: 0x99a0af, desert: 0xe4d19d, water: 0x1d6c81, gold: 0xe2bf5c,
+  lake: 0x1d6c81, castle: 0x99a0af, pitch: 0xa0cc6f, fog: 0x7c8e87,
 };
+const LAND_HEIGHT = 12; // 陸のマスはすべて同じ高さ。水だけ低い
 const TERRAIN_HEIGHT = {
-  forest: 16, pasture: 11, field: 11, hills: 15, mountains: 24, desert: 9,
-  water: 3, gold: 13, lake: 3, castle: 20, pitch: 8, fog: 12,
+  forest: LAND_HEIGHT, pasture: LAND_HEIGHT, field: LAND_HEIGHT, hills: LAND_HEIGHT, mountains: LAND_HEIGHT,
+  desert: LAND_HEIGHT, water: 3, gold: LAND_HEIGHT, lake: 3, castle: LAND_HEIGHT, pitch: LAND_HEIGHT, fog: LAND_HEIGHT,
 };
 const RES_COLOR3D = { wood: 0x3f8a4a, brick: 0xc0643a, sheep: 0x8cc063, wheat: 0xe0b440, ore: 0x8a92a3 };
 const TERRAIN_ROUGH = {
   forest: 0.95, pasture: 0.85, field: 0.7, hills: 0.9, mountains: 0.95, desert: 0.9,
   water: 0.2, gold: 0.5, lake: 0.2, castle: 0.8, pitch: 0.65, fog: 0.9,
 };
-// CC0の実写テクスチャ(Poly Haven、出典はtextures/CREDITS.md)を使う地形。
-// 水・金・城・ピッチ・霧は面積が小さく模様が目立たないので、今まで通り手続き的なCanvasの模様のまま。
+// CC0の実写テクスチャ(Poly Haven、出典はtextures/CREDITS.md)の凹凸(法線)だけを使う地形。
+// 色は2Dと揃えるため、どの地形も手続き的なCanvasの模様(TERRAIN_COLOR)にする。
 const TERRAIN_PHOTO = {
   forest: './textures/forest.jpg', pasture: './textures/pasture.jpg', field: './textures/field.jpg',
   hills: './textures/hills.jpg', mountains: './textures/mountains.jpg', desert: './textures/desert.jpg',
@@ -345,35 +346,26 @@ function terrainTexture(terrain) {
 const PHOTO_REPEAT = 1.6;
 const photoLoader = new THREE.TextureLoader();
 const photoTexCache = new Map();
-function loadPhotoTex(url, srgb) {
+function loadPhotoTex(url) {
   const tex = photoLoader.load(url);
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.repeat.set(PHOTO_REPEAT, PHOTO_REPEAT);
   if (renderer) tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
-  if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
 }
 function photoTerrainTextures(terrain) {
   if (photoTexCache.has(terrain)) return photoTexCache.get(terrain);
   const base = TERRAIN_PHOTO[terrain];
-  const out = {
-    map: loadPhotoTex(base, true),
-    normalMap: loadPhotoTex(base.replace(/(\.jpg)$/, '_nor$1'), false),
-  };
+  const out = { normalMap: loadPhotoTex(base.replace(/(\.jpg)$/, '_nor$1')) };
   photoTexCache.set(terrain, out);
   return out;
 }
 function getTerrainMaterial(terrain) {
   if (TERRAIN_MAT[terrain]) return TERRAIN_MAT[terrain];
-  const mat = TERRAIN_PHOTO[terrain]
-    ? new THREE.MeshStandardMaterial({
-      ...photoTerrainTextures(terrain),
-      color: new THREE.Color(TERRAIN_COLOR[terrain]).lerp(new THREE.Color(0xffffff), 0.55),
-      roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
-    })
-    : new THREE.MeshStandardMaterial({
-      map: terrainTexture(terrain), roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
-    });
+  const mat = new THREE.MeshStandardMaterial({
+    map: terrainTexture(terrain), roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
+    ...(TERRAIN_PHOTO[terrain] && { normalMap: photoTerrainTextures(terrain).normalMap }),
+  });
   TERRAIN_MAT[terrain] = mat;
   return mat;
 }
