@@ -15,15 +15,27 @@ import * as THREE from './vendor/three.module.min.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { RoomEnvironment } from './vendor/RoomEnvironment.js';
 import { RGBELoader } from './vendor/RGBELoader.js';
+import { EffectComposer } from './vendor/postprocessing/EffectComposer.js';
+import { RenderPass } from './vendor/postprocessing/RenderPass.js';
+import { GTAOPass } from './vendor/postprocessing/GTAOPass.js';
+import { UnrealBloomPass } from './vendor/postprocessing/UnrealBloomPass.js';
+import { LUTPass } from './vendor/postprocessing/LUTPass.js';
+import { SMAAPass } from './vendor/postprocessing/SMAAPass.js';
+import { OutputPass } from './vendor/postprocessing/OutputPass.js';
 
 const SCALE = 66; // main.jsのSCALEと同じ値（頂点のx,yをこの倍率でワールド座標にする）
 const REDUCE_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 const QUALITY = (() => { try { return new URLSearchParams(location.search).get('q') === 'high' ? 'high' : 'mid'; } catch { return 'mid'; } })();
 // ponytail: 品質はこの定数だけで決める。⑤でUIのトグルを足すときはここを書き換える処理を足すだけでよい。
 const Q = {
-  mid: { cell: 4, maxGrid: 240 },
-  high: { cell: 1.3, maxGrid: 520 }, // 盤全体で512×512以上(ブリーフの要求)
+  mid: { cell: 4, maxGrid: 240, shadowMap: 2048, gtaoSamples: 10, bloom: false, dprCap: 2 },
+  high: { cell: 1.3, maxGrid: 520, shadowMap: 4096, gtaoSamples: 16, bloom: true, dprCap: 2.5 }, // 盤全体で512x512以上(ブリーフの要求)
 }[QUALITY];
+// 太陽の向き(午後の低い角度)。方位はカメラが見やすい斜め後ろから、高度25-35°
+const SUN_AZIMUTH = Math.PI * 0.64;
+const SUN_ELEVATION = Math.PI / 180 * 29;
+// マス中心の座標+地形idをシェーダへ渡す上限(5-6人拡張込みの最大枚数30に余裕を見た数)
+const MAX_LAND_HEXES = 36;
 
 // ---- 地形の寸法(engine.jsのhexCorner/hexCenterと同じ単位。circumradius=1をSCALE倍) ----
 const HEX_R = SCALE; // 中心→頂点(円周半径)
@@ -64,7 +76,11 @@ let onTapCb = null;
 let hitTargets = []; // [{ mesh, kind, id }]（レイキャストで拾う的）
 let pulseMeshes = []; // 明滅させる的（置ける場所・盗賊など）
 let framedForHexCount = null;
+let hasDebugCam = false; // ?camが指定されていたら、frameCamera()でカメラ位置を奪い返さない
 let oceanUniforms = null;
+let landUniforms = null;
+let composer = null; // EffectComposer(GTAO/ブルーム/LUT/SMAA/OutputPass)。renderer.render直接呼びはしない
+let gtaoPass = null, bloomPass = null, smaaPass = null;
 
 // ---- 共通ジオメトリ（使い回す。インスタンスごとに作らない） ----
 const GEO = {
@@ -98,6 +114,57 @@ function clampUnit(v) { return Math.min(1, Math.max(0, v)); }
 function smoothstep(lo, hi, v) { const t = clampUnit((v - lo) / (hi - lo)); return t * t * (3 - 2 * t); }
 function lerp(a, b, t) { return a + (b - a) * t; }
 
+// 色調整のLUT(3D Data Texture)をコードで作る(.cubeファイルを持たないぶん軽い)。
+// 「彩度を少し落とし、影をわずかに青く、ハイライトを暖かく」。恒等変換からのズレは小さく抑える。
+function buildColorLUT(size) {
+  const data = new Uint8Array(size * size * size * 4);
+  const SAT = 0.9; // 1よりわずかに落とす
+  for (let b = 0; b < size; b++) {
+    for (let g = 0; g < size; g++) {
+      for (let r = 0; r < size; r++) {
+        let R = r / (size - 1), G = g / (size - 1), B = b / (size - 1);
+        const luma = R * 0.299 + G * 0.587 + B * 0.114;
+        R = luma + (R - luma) * SAT; G = luma + (G - luma) * SAT; B = luma + (B - luma) * SAT;
+        const shadowW = 1 - smoothstep(0.12, 0.5, luma); // 暗部ほど強く青みを足す
+        const highW = smoothstep(0.5, 0.92, luma); // 明部ほど強く暖色を足す
+        R += highW * 0.045 - shadowW * 0.015;
+        G += highW * 0.015;
+        B += highW * -0.035 + shadowW * 0.05;
+        const idx = (b * size * size + g * size + r) * 4;
+        data[idx] = Math.round(clampUnit(R) * 255);
+        data[idx + 1] = Math.round(clampUnit(G) * 255);
+        data[idx + 2] = Math.round(clampUnit(B) * 255);
+        data[idx + 3] = 255;
+      }
+    }
+  }
+  const tex = new THREE.Data3DTexture(data, size, size, size);
+  tex.format = THREE.RGBAFormat;
+  tex.type = THREE.UnsignedByteType;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  tex.wrapS = tex.wrapT = tex.wrapR = THREE.ClampToEdgeWrapping;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// 地形・海のシェーダ両方で使う「ゆっくり流れる雲の影」のGLSL(薄く乗算するだけ)。
+// 値ノイズ(双線形補間つき)をuTimeでずらして動かす。
+const CLOUD_GLSL = `
+  float cloudHash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+  float cloudNoise(vec2 p) {
+    vec2 i = floor(p), f = fract(p);
+    float a = cloudHash(i), b = cloudHash(i + vec2(1.0, 0.0));
+    float c = cloudHash(i + vec2(0.0, 1.0)), d = cloudHash(i + vec2(1.0, 1.0));
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(a, b, u.x) + (c - a) * u.y * (1.0 - u.x) + (d - b) * u.x * u.y;
+  }
+  float cloudShadow(vec2 worldXZ, float t) {
+    vec2 p = worldXZ * 0.0022 + vec2(t * 0.010, t * 0.006);
+    float n = cloudNoise(p) * 0.6 + cloudNoise(p * 2.1 + 19.0) * 0.4;
+    return mix(0.9, 1.0, smoothstep(0.32, 0.72, n));
+  }
+`;
+
 export function initBoard3D(container, onTap) {
   onTapCb = onTap;
   scene = new THREE.Scene();
@@ -105,35 +172,44 @@ export function initBoard3D(container, onTap) {
   scene.fog = new THREE.Fog(0xbfe3f2, 900, 2200);
 
   camera = new THREE.PerspectiveCamera(42, 1, 1, 4000);
-  renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  // 細い指での操作が多い環境(タッチ)は解像度を少し落として重さを抑える
-  const dprCap = (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ? 1.5 : 2;
+  // SMAAPassがAAを引き受けるので、WebGLRenderer自体のMSAAは切って二重にしない
+  renderer = new THREE.WebGLRenderer({ antialias: false, alpha: false });
+  // 細い指での操作が多い環境(タッチ)は解像度を少し落として重さを抑える。高品質はデスクトップ前提で上げる
+  const dprCap = (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ? 1.5 : Q.dprCap;
   renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
-  renderer.toneMappingExposure = 1.05;
+  renderer.toneMappingExposure = 0.95;
   container.appendChild(renderer.domElement);
 
   // 環境光(映り込み)。まずRoomEnvironmentですぐ出し、CC0の屋外HDRI(textures/CREDITS.md)が
   // 読み込めたら差し替える(読み込みに失敗・時間がかかっても画面は止めない)。
+  // 背景もこのHDRI(午後の晴天)にして、海の向こうに霞んだ空と地平線が見えるようにする。
+  // 読み込みが終わるまで/失敗時はこれまで通りCanvasのグラデーション(skyTexture)。
   const pmrem = new THREE.PMREMGenerator(renderer);
   scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
   new RGBELoader().load('./textures/sky.hdr', (hdr) => {
+    hdr.mapping = THREE.EquirectangularReflectionMapping;
     const envMap = pmrem.fromEquirectangular(hdr).texture;
     scene.environment = envMap;
-    hdr.dispose();
+    scene.background = hdr;
+    scene.backgroundIntensity = 1;
     pmrem.dispose();
   }, undefined, () => { pmrem.dispose(); });
 
-  scene.add(new THREE.HemisphereLight(0xdcefff, 0x1a2a1a, 0.6));
-  sun = new THREE.DirectionalLight(0xfff2d6, 1.4);
-  sun.position.set(260, 480, 180);
+  scene.add(new THREE.HemisphereLight(0xdceeff, 0x24321e, 0.55));
+  // 午後の低い太陽。暖色だが地形の色そのものを赤く染めないよう、彩度は控えめな暖白にする
+  sun = new THREE.DirectionalLight(0xfff0d6, 1.7);
   sun.castShadow = true;
-  sun.shadow.mapSize.set(1024, 1024);
-  sun.shadow.camera.near = 10; sun.shadow.camera.far = 1600;
+  sun.shadow.mapSize.set(Q.shadowMap, Q.shadowMap);
+  sun.shadow.bias = -0.00018;
+  sun.shadow.normalBias = 1.4; // シーンのスケールが大きい(1単位≒数m)ぶん大きめの値にしてアクネを消す
+  sun.shadow.camera.near = 10; sun.shadow.camera.far = 1600; // 盤の大きさが分かり次第updateSunForBoard()で詰め直す
   scene.add(sun);
+  // 太陽を仮置き(盤の大きさが分かる最初のframeCamera()でupdateSunForBoard()が向き直す)
+  updateSunForBoard(HEX_R * 3);
 
   // 木・羊・麦・岩などに使う材質は、個体ごとに色をわずかにずらす(InstancedMeshの頂点カラー)
   [MAT.leaf, MAT.sheep, MAT.wheat, MAT.mound, MAT.peak, MAT.cactus].forEach((m) => { m.vertexColors = true; });
@@ -152,6 +228,8 @@ export function initBoard3D(container, onTap) {
   sceneGroup = new THREE.Group();
   scene.add(sceneGroup);
 
+  buildComposer(container);
+
   attachInput(renderer.domElement);
   new ResizeObserver(() => resize(container)).observe(container);
   resize(container);
@@ -159,11 +237,56 @@ export function initBoard3D(container, onTap) {
   renderer.setAnimationLoop(animate);
 }
 
+// 後処理一式: RenderPass -> GTAO -> (高品質のみ)Bloom -> LUT(色調整) -> SMAA -> OutputPass。
+// GTAOPass・SMAAPassはシーンのスケール(1単位≒数m)に合わせて半径などを調整している。
+function buildComposer(container) {
+  const w = Math.max(1, container.clientWidth || 1), h = Math.max(1, container.clientHeight || 1);
+  composer = new EffectComposer(renderer);
+  composer.addPass(new RenderPass(scene, camera));
+
+  gtaoPass = new GTAOPass(scene, camera, w, h,
+    {},
+    { radius: 7, distanceExponent: 1.5, thickness: 1.6, scale: 1, samples: Q.gtaoSamples, distanceFallOff: 0.6, screenSpaceRadius: false },
+    {});
+  gtaoPass.output = GTAOPass.OUTPUT.Default;
+  gtaoPass.blendIntensity = 0.6; // 薄く(ハローが目立たない程度)
+  composer.addPass(gtaoPass);
+
+  if (Q.bloom) {
+    bloomPass = new UnrealBloomPass(new THREE.Vector2(w, h), 0.10, 0.35, 0.94); // 弱め・白飛びしない程度(strength 0.10)
+    composer.addPass(bloomPass);
+  }
+
+  composer.addPass(new LUTPass({ lut: buildColorLUT(16), intensity: 1 }));
+
+  smaaPass = new SMAAPass(w * renderer.getPixelRatio(), h * renderer.getPixelRatio());
+  composer.addPass(smaaPass);
+
+  composer.addPass(new OutputPass());
+}
+
 function resize(container) {
   const w = container.clientWidth || 1, h = container.clientHeight || 1;
   camera.aspect = w / h;
   camera.updateProjectionMatrix();
   renderer.setSize(w, h, false);
+  if (composer) composer.setSize(w, h);
+}
+
+// 太陽を盤の大きさ(maxR)に合わせて配置し直し、影カメラの範囲もきっちり覆う。
+// 盤の形が変わる・初回の計測が終わるたびにframeCamera()から呼ばれる。
+function updateSunForBoard(maxR) {
+  const dist = Math.max(500, maxR * 2.4);
+  const horiz = Math.cos(SUN_ELEVATION) * dist;
+  sun.position.set(Math.cos(SUN_AZIMUTH) * horiz, Math.sin(SUN_ELEVATION) * dist, Math.sin(SUN_AZIMUTH) * horiz);
+  sun.target.position.set(0, 0, 0);
+  sun.target.updateMatrixWorld();
+  sun.shadow.camera.near = Math.max(1, dist - maxR * 3);
+  sun.shadow.camera.far = dist + maxR * 3;
+  const sd = maxR * 1.15;
+  sun.shadow.camera.left = -sd; sun.shadow.camera.right = sd;
+  sun.shadow.camera.top = sd; sun.shadow.camera.bottom = -sd;
+  sun.shadow.camera.updateProjectionMatrix();
 }
 
 // 比較用スクリーンショットのための一時的なデバッグ口。
@@ -177,7 +300,11 @@ function applyDebugCamera() {
   camera.position.set(n[0], n[1], n[2]);
   controls.target.set(n[3], n[4], n[5]);
   controls.enabled = false;
+  // デバッグ用途なので、比較スクリーンショットのために普段のズーム・角度の制限を外す
+  controls.minDistance = 0; controls.maxDistance = Infinity;
+  controls.minPolarAngle = 0; controls.maxPolarAngle = Math.PI;
   controls.update();
+  hasDebugCam = true;
 }
 
 // ---- タップ／ドラッグの見分け（しきい値を超えて動いたら回転操作として無視する） ----
@@ -224,14 +351,17 @@ function skyTexture() {
 
 function animate() {
   const t = clock.getElapsedTime();
-  if (oceanUniforms && !REDUCE_MOTION) oceanUniforms.uTime.value = t;
+  if (!REDUCE_MOTION) {
+    if (oceanUniforms) oceanUniforms.uTime.value = t;
+    if (landUniforms) landUniforms.uTime.value = t;
+  }
   pulseMeshes.forEach((m, i) => {
     const k = 0.55 + Math.sin(t * 3 + i * 0.6) * 0.45;
     if (m.material.emissiveIntensity != null) m.material.emissiveIntensity = 0.4 + k * 1.1;
     if (m.userData.baseScale) { const s = m.userData.baseScale * (1 + k * 0.08); m.scale.setScalar(s); }
   });
   controls.update();
-  renderer.render(scene, camera);
+  if (composer) composer.render(); else renderer.render(scene, camera);
 }
 
 // ---- 小さな組み立てヘルパー ----
@@ -496,20 +626,33 @@ function buildLandMaterial() {
   const sharedNormal = sets[1].normalMap; // pastureの法線を共有(リピートは細かめ)
   sharedNormal.repeat.set(5, 5);
   const mat = new THREE.MeshStandardMaterial({ normalMap: sharedNormal, roughness: 0.95, metalness: 0.02 });
+  // マスの境目(地形id・ブレンド具合)は、頂点グリッドの粗さに縛られないよう頂点属性でなく
+  // フラグメントシェーダ側でマス中心までの距離から毎ピクセル求める(①の残課題: 境目のギザギザ対策)。
+  // マス中心の座標・地形idはupdateLandHexUniforms()が盤の形が変わるたびに書き込む。
+  landUniforms = {
+    uHexXZ: { value: Array.from({ length: MAX_LAND_HEXES }, () => new THREE.Vector2(1e6, 1e6)) },
+    uHexTid: { value: new Array(MAX_LAND_HEXES).fill(1) },
+    uHexN: { value: 0 },
+    uTime: { value: 0 },
+  };
   mat.onBeforeCompile = (shader) => {
     TERRAIN_NAMES.forEach((_, i) => { shader.uniforms['uTex' + i] = { value: sets[i].map }; });
+    Object.assign(shader.uniforms, landUniforms);
     shader.vertexShader = shader.vertexShader
       .replace('#include <common>', `#include <common>
-        attribute float terrainA; attribute float terrainB; attribute float mixT; attribute float slope; attribute float coastW;
-        varying float vTerrainA; varying float vTerrainB; varying float vMixT; varying float vSlope; varying float vCoastW;
-        varying vec2 vTerrainUv;`)
+        attribute float slope; attribute float coastW;
+        varying float vSlope; varying float vCoastW;
+        varying vec2 vTerrainUv; varying vec2 vWorldXZ;`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
-        vTerrainA = terrainA; vTerrainB = terrainB; vMixT = mixT; vSlope = slope; vCoastW = coastW; vTerrainUv = uv;`);
+        vSlope = slope; vCoastW = coastW; vTerrainUv = uv;
+        vWorldXZ = (modelMatrix * vec4(transformed, 1.0)).xz;`);
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>
-        varying float vTerrainA; varying float vTerrainB; varying float vMixT; varying float vSlope; varying float vCoastW;
-        varying vec2 vTerrainUv;
+        varying float vSlope; varying float vCoastW;
+        varying vec2 vTerrainUv; varying vec2 vWorldXZ;
+        uniform vec2 uHexXZ[${MAX_LAND_HEXES}]; uniform float uHexTid[${MAX_LAND_HEXES}]; uniform int uHexN; uniform float uTime;
         ${TERRAIN_NAMES.map((_, i) => `uniform sampler2D uTex${i};`).join('\n        ')}
+        ${CLOUD_GLSL}
         float detailHash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
         // 地形ごとの狙った色味へ寄せる(元のCC0テクスチャの素の色だけでは地形が読み分けにくいため)。
         // テクスチャの濃淡(ディテール)は保ちつつ、色相だけtintへ引っ張る軽いmix。
@@ -530,17 +673,33 @@ function buildLandMaterial() {
           float luma = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
           vec3 toned = mix(vec3(luma), tex.rgb, 0.35) * terrainTint(id) * 1.9;
           return vec4(toned, tex.a);
+        }
+        // 最寄り2マスの地形idとブレンド具合を、マス中心までの距離からその場(毎ピクセル)で求める。
+        // 頂点グリッドの解像度に縛られないので、境目が階段状にならない。
+        void nearestTwoHex(vec2 p, out float id1, out float id2, out float mixT) {
+          float d1 = 1e9, d2 = 1e9; float i1 = 1.0, i2 = 1.0;
+          for (int i = 0; i < ${MAX_LAND_HEXES}; i++) {
+            if (i >= uHexN) break;
+            float dd = distance(p, uHexXZ[i]);
+            if (dd < d1) { d2 = d1; i2 = i1; d1 = dd; i1 = uHexTid[i]; }
+            else if (dd < d2) { d2 = dd; i2 = uHexTid[i]; }
+          }
+          id1 = i1; id2 = i2;
+          mixT = smoothstep(-${HEX_BLEND.toFixed(1)}, ${HEX_BLEND.toFixed(1)}, d2 - d1);
         }`)
       .replace('#include <map_fragment>', `
         {
           vec2 uv = vTerrainUv;
-          vec4 base = mix(sampleTerrainTex(int(vTerrainB + 0.5), uv), sampleTerrainTex(int(vTerrainA + 0.5), uv), vMixT);
+          float hId1, hId2, hMixT;
+          nearestTwoHex(vWorldXZ, hId1, hId2, hMixT);
+          vec4 base = mix(sampleTerrainTex(int(hId2 + 0.5), uv), sampleTerrainTex(int(hId1 + 0.5), uv), hMixT);
           base = mix(base, sampleTerrainTex(${SAND_ID}, uv), vCoastW);
           float slopeW = smoothstep(${SLOPE_LO.toFixed(2)}, ${SLOPE_HI.toFixed(2)}, vSlope);
           base = mix(base, sampleTerrainTex(${ROCK_ID}, uv), slopeW);
           #ifdef DECODE_VIDEO_TEXTURE
             base = sRGBTransferEOTF(base);
           #endif
+          base.rgb *= cloudShadow(vWorldXZ, uTime);
           diffuseColor *= base;
         }`);
   };
@@ -601,9 +760,6 @@ function buildTerrainMesh(g, field) {
   const count = nx * nz;
   const pos = new Float32Array(count * 3);
   const uv = new Float32Array(count * 2);
-  const terrainA = new Float32Array(count);
-  const terrainB = new Float32Array(count);
-  const mixT = new Float32Array(count);
   const coastW = new Float32Array(count);
   const slope = new Float32Array(count); // computeVertexNormals後に埋める
   const isWaterAt = new Uint8Array(count);
@@ -616,7 +772,8 @@ function buildTerrainMesh(g, field) {
       const k = j * nx + i;
       pos[k * 3] = x; pos[k * 3 + 1] = s.height; pos[k * 3 + 2] = z;
       uv[k * 2] = x * UV_SCALE; uv[k * 2 + 1] = z * UV_SCALE;
-      terrainA[k] = s.terrainIdA; terrainB[k] = s.terrainIdB; mixT[k] = s.mixT;
+      // 地形id・ブレンド(terrainA/B/mixT)はここでは持たず、land材質のフラグメントシェーダが
+      // 毎ピクセル、マス中心までの距離から直接求める(頂点グリッドの粗さで境目が階段状になるのを防ぐ)。
       coastW[k] = (!s.isWater && s.coastStyle === 'beach') ? s.coastT : 0;
       isWaterAt[k] = s.isWater ? 1 : 0;
     }
@@ -631,9 +788,6 @@ function buildTerrainMesh(g, field) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
-  geo.setAttribute('terrainA', new THREE.BufferAttribute(terrainA, 1));
-  geo.setAttribute('terrainB', new THREE.BufferAttribute(terrainB, 1));
-  geo.setAttribute('mixT', new THREE.BufferAttribute(mixT, 1));
   geo.setAttribute('coastW', new THREE.BufferAttribute(coastW, 1));
   geo.setAttribute('slope', new THREE.BufferAttribute(slope, 1));
 
@@ -729,7 +883,8 @@ function buildOcean(g, field) {
       .replace('#include <common>', `#include <common>
         uniform vec3 uShallow; uniform vec3 uDeep; uniform vec3 uFoam; uniform float uTime;
         uniform sampler2D uHeightTex; uniform vec2 uHOrigin; uniform vec2 uHSize;
-        varying vec3 vWorldPosOcean;`)
+        varying vec3 vWorldPosOcean;
+        ${CLOUD_GLSL}`)
       .replace('#include <map_fragment>', `
         {
           vec2 huv = (vWorldPosOcean.xz - uHOrigin) / uHSize;
@@ -742,6 +897,7 @@ function buildOcean(g, field) {
           float foam = 1.0 - smoothstep(0.0, 2.2, depth);
           float shimmer = 0.75 + 0.25 * sin(vWorldPosOcean.x * 0.05 + vWorldPosOcean.z * 0.07 + uTime * 1.2);
           base = mix(base, uFoam, foam * shimmer);
+          base *= cloudShadow(vWorldPosOcean.xz, uTime);
           diffuseColor.rgb *= base;
         }`);
   };
@@ -768,10 +924,23 @@ function rebuildTerrainAndOcean(g) {
   }
   const field = buildTerrainField(g);
   hexHeight = computeHexHeights(g, field);
-  terrainGroup = buildTerrainMesh(g, field);
+  terrainGroup = buildTerrainMesh(g, field); // getLandMaterial()を呼ぶのでlandUniformsはここまでに必ずできている
   scene.add(terrainGroup);
+  updateLandHexUniforms(field);
   oceanMesh = buildOcean(g, field);
   scene.add(oceanMesh);
+}
+
+// マス中心の座標+地形id(land材質のnearestTwoHex()用)を書き込む。拡張で枚数が変わっても
+// シェーダの再コンパイルは要らない(配列サイズはMAX_LAND_HEXES固定、余りはuHexNで無視される)。
+function updateLandHexUniforms(field) {
+  if (!landUniforms) return;
+  const n = Math.min(field.hexes.length, MAX_LAND_HEXES);
+  for (let i = 0; i < n; i++) {
+    landUniforms.uHexXZ.value[i].set(field.centers[i].cx, field.centers[i].cz);
+    landUniforms.uHexTid.value[i] = terrainIdOf(field.hexes[i].terrain);
+  }
+  landUniforms.uHexN.value = n;
 }
 
 // hexの基準の高さ(ships/portsはいつも海面、陸は地形メッシュのマス中心の高さ)
@@ -979,17 +1148,19 @@ function frameCamera(g) {
   framedForHexCount = g.hexes.length;
   let maxR = 0;
   g.vertices.forEach((v) => { maxR = Math.max(maxR, Math.hypot(v.x * SCALE, v.y * SCALE)); });
-  const dist = maxR * 1.9;
-  camera.position.set(0, dist * 0.78, dist * 0.68);
-  controls.target.set(0, 0, 0);
-  controls.minDistance = maxR * 0.5;
-  controls.maxDistance = maxR * 3.2;
-  controls.update();
-  // 影の範囲を盤の大きさに合わせて締める(広すぎると影がぼやける)
-  const sd = maxR * 1.15;
-  sun.shadow.camera.left = -sd; sun.shadow.camera.right = sd;
-  sun.shadow.camera.top = sd; sun.shadow.camera.bottom = -sd;
-  sun.shadow.camera.updateProjectionMatrix();
+  if (!hasDebugCam) { // ?camで固定しているときは、ここでカメラを奪い返さない(比較スクリーンショット用)
+    const dist = maxR * 1.9;
+    camera.position.set(0, dist * 0.78, dist * 0.68);
+    controls.target.set(0, 0, 0);
+    controls.minDistance = maxR * 0.5;
+    controls.maxDistance = maxR * 3.2;
+    controls.update();
+  }
+  // 奥行き(遠近の深度バッファ)の精度をGTAO/SMAAのために盤の大きさへ詰める
+  camera.far = Math.max(1200, maxR * 6);
+  camera.updateProjectionMatrix();
+  // 太陽の向き・影カメラの範囲を盤の大きさに合わせ直す(広すぎると影がぼやける)
+  updateSunForBoard(maxR);
 }
 
 function addNumberChip(x, z, baseY, n, hot, scale) {

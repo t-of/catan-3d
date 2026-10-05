@@ -12,7 +12,7 @@
 // PREFIX 'catan-' の前方一致に引っかかり(''catan-3d-v1'.startsWith('catan-')===true)、
 // catan 側の activate が catan-3d のキャッシュまで消してしまう。それを避けるための名前。
 const PREFIX = 'catan3d-';
-const VERSION = 'v7';
+const VERSION = 'v8';
 const CACHE = `${PREFIX}${VERSION}`;
 const FONT_CACHE = `${PREFIX}fonts`;
 
@@ -32,6 +32,23 @@ const SHELL = [
   './vendor/OrbitControls.js',
   './vendor/RoomEnvironment.js',
   './vendor/RGBELoader.js',
+  './vendor/postprocessing/EffectComposer.js',
+  './vendor/postprocessing/Pass.js',
+  './vendor/postprocessing/RenderPass.js',
+  './vendor/postprocessing/ShaderPass.js',
+  './vendor/postprocessing/MaskPass.js',
+  './vendor/postprocessing/GTAOPass.js',
+  './vendor/postprocessing/UnrealBloomPass.js',
+  './vendor/postprocessing/LUTPass.js',
+  './vendor/postprocessing/SMAAPass.js',
+  './vendor/postprocessing/OutputPass.js',
+  './vendor/shaders/CopyShader.js',
+  './vendor/shaders/LuminosityHighPassShader.js',
+  './vendor/shaders/SMAAShader.js',
+  './vendor/shaders/GTAOShader.js',
+  './vendor/shaders/PoissonDenoiseShader.js',
+  './vendor/shaders/OutputShader.js',
+  './vendor/math/SimplexNoise.js',
   './textures/forest_diff.jpg',
   './textures/forest_nor.jpg',
   './textures/forest_arm.jpg',
