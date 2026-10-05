@@ -396,7 +396,16 @@ const els = {
   cutinLayer: document.getElementById('cutinLayer'),
   board3dHost: document.getElementById('board3d'),
 };
-initBoard3D(els.board3dHost, boardTap3D);
+try {
+  initBoard3D(els.board3dHost, boardTap3D);
+} catch (err) {
+  // WebGLが使えない端末(古い端末・一部のプライバシー設定など)。盤だけ諦め、アプリの他の部分
+  // (手札・交易・CPUなど)は止めずに続ける。盤面は空のままになるが、ボタン操作は生きている。
+  console.error('[catan-3d] 3D盤が使えないため表示をあきらめます', err);
+  els.board3dHost.textContent = 'この端末では立体の盤が表示できません(WebGL非対応)。';
+  els.board3dHost.style.cssText = 'display:flex;align-items:center;justify-content:center;'
+    + 'text-align:center;padding:24px;color:var(--muted,#9fb0bd);';
+}
 
 const SCALE = 66; // 1マス単位(外接円半径1) → SVG座標のピクセル。illust.js の地形の絵は R=66 に合わせて置いてある。
 const RES_LABEL = { wood: '木', brick: '土', sheep: '羊', wheat: '麦', ore: '鉄' };

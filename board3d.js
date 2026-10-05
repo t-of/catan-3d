@@ -414,6 +414,20 @@ const CLOUD_GLSL = `
 `;
 
 export function initBoard3D(container, onTap) {
+  try {
+    initBoard3DUnsafe(container, onTap);
+  } catch (err) {
+    // WebGLが無い/壊れた端末(古い端末、一部のプライバシー設定、headlessなど)でWebGLRendererの
+    // コンストラクタが例外を投げると、ここで止めないとmain.js側の以降の初期化が全部巻き込まれて
+    // アプリ全体が動かなくなる。sceneをnullに戻し、以降のrenderBoard3D呼び出しは何もしない
+    // (renderBoard3D先頭のif (!scene) returnで無視される)。
+    console.error('[catan-3d] 3D盤の初期化に失敗', err);
+    scene = null;
+    throw err;
+  }
+}
+
+function initBoard3DUnsafe(container, onTap) {
   onTapCb = onTap;
   scene = new THREE.Scene();
   scene.background = skyTexture();
