@@ -21,8 +21,8 @@ const REDUCE_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduce
 const QUALITY = (() => { try { return new URLSearchParams(location.search).get('q') === 'high' ? 'high' : 'mid'; } catch { return 'mid'; } })();
 // ponytail: 品質はこの定数だけで決める。⑤でUIのトグルを足すときはここを書き換える処理を足すだけでよい。
 const Q = {
-  mid: { cell: 7, maxGrid: 140 },
-  high: { cell: 3.2, maxGrid: 260 },
+  mid: { cell: 4, maxGrid: 240 },
+  high: { cell: 1.3, maxGrid: 520 }, // 盤全体で512×512以上(ブリーフの要求)
 }[QUALITY];
 
 // ---- 地形の寸法(engine.jsのhexCorner/hexCenterと同じ単位。circumradius=1をSCALE倍) ----
@@ -30,17 +30,29 @@ const HEX_R = SCALE; // 中心→頂点(円周半径)
 const HEX_A = SCALE * Math.sqrt(3) / 2; // 中心→辺の中点(アポセム)
 const LAND_BASE = 14; // 陸の基準の高さ(マス中心の平らな部分)
 const SEA_LEVEL = 0; // 海面(港・船・浮く物の基準)
-const SHELF = -9; // 渚のすぐ沖(浅瀬の棚)。海面(0)の波の揺れ(最大±2.5ほど)より十分下げて、海面と重ならないようにする
-const SEABED = -22; // 沖の海底
-const BOUNDARY_LO = 0.74, BOUNDARY_HI = 1.02; // マス中心からの距離(÷アポセム)のうち、起伏を減衰させはじめる~境目に達する範囲
+const SHELF = -3; // 渚のすぐ沖(浅瀬の棚)。海のシェーダはここを「浅い」側の基準にするので海面(0)に近づける
+const SEABED = -26; // 沖の海底
 const RES_COLOR3D = { wood: 0x3f8a4a, brick: 0xc0643a, sheep: 0x8cc063, wheat: 0xe0b440, ore: 0x8a92a3 };
 
 // 地形ごとのCC0 PBR一式(出典はtextures/CREDITS.md)。gold/castle/pitch/lake/fogは拡張用の特殊地形で、
 // 見た目は代用(pasture寄り)にする。water/lakeは地面でなく海(terrainSample内で別扱い)。
-const TERRAIN_SET = {
-  forest: 'forest', pasture: 'pasture', field: 'field', hills: 'hills', mountains: 'mountains', desert: 'desert',
-};
+// 配列の並びがそのままシェーダのterrain id(0〜5)。ROCK_ID/SAND_IDは斜面・渚のブレンド先として使う。
+const TERRAIN_NAMES = ['forest', 'pasture', 'field', 'hills', 'mountains', 'desert'];
+const ROCK_ID = TERRAIN_NAMES.indexOf('mountains');
+const SAND_ID = TERRAIN_NAMES.indexOf('desert');
 const WATER_LIKE = new Set(['water', 'lake']);
+
+// ---- 島の形まわりの定数 ----
+// マス同士(陸×陸)の材質・起伏を混ぜる幅。真の渚(海岸線)からの距離とは別物で、どの地形でも常に効く。
+const HEX_BLEND = 20;
+// 渚から陸側に戻る帯(この中でLAND_BASEへ、またはLAND_BASEから渚の高さへなだらかに移る)
+const COAST_BAND = 40;
+// 渚から沖に向かって浅瀬→海底まで落ちきる距離
+const DEEP_BAND = HEX_A * 1.9;
+// 海岸線の形をいびつにするノイズの振れ幅(渚からの距離そのものを揺らす)
+const COAST_JITTER = 22;
+// 斜面を岩肌に切り替える、法線の傾き(1-normal.y)のしきい値。この間でsmoothstep
+const SLOPE_LO = 0.14, SLOPE_HI = 0.34;
 
 let scene, camera, renderer, controls, raycaster, pointer, clock, sun;
 let sceneGroup; // 毎回まるごと作り直す小物(木・建物・盗賊・overlayなど)
@@ -320,94 +332,119 @@ function ridged(x, z, seed, freq, oct) {
   }
   return norm ? sum / norm : 0;
 }
-// 海岸線をゆらす共通のノイズ場(波長は数マス分)。水マスの判定境界だけに足し、陸マス同士の境目は揺らさない
+// 海岸線をゆらす共通のノイズ場(波長は数マス分)。渚からの距離そのものに足して、線を不規則にする
 function coastNoise(x, z) { return fbm(x, z, 0.0055, 999, 2); }
 
-// 地形ごとの起伏の形(マス中心からの高さの上積み。境界では減衰させてから足す)
+// 地形ごとの起伏の形(マス中心からの高さの上積み)。境目(マス間)での減衰はここではせず、
+// 隣り合う2マスの値をbuildTerrainField側で数mかけて混ぜる(なじませても陸でなくなることはない)。
 // 振幅と周波数の積(≒傾き)を抑えめにして、地形ごとに狙った傾斜になるようにする。
 // 山だけ故意に急(尾根・崖)にし、ほかは「斜面の角度で岩肌に切り替える」判定にあまり掛からない程度にする。
 function terrainBump(terrain, x, z, seed) {
-  const island = fbm(x, z, 0.0035, 42, 2) * 5; // 島全体を通る緩いうねり(マスをまたぐ大きな起伏)
+  const island = fbm(x, z, 0.0035, 42, 2) * 3; // 島全体を通る緩いうねり(マスをまたぐ大きな起伏)
   switch (terrain) {
-    case 'forest': return island + fbm(x, z, 0.012, seed, 3) * 5 + fbm(x, z, 0.045, seed + 50, 2) * 1.3;
-    case 'pasture': return island + fbm(x, z, 0.011, seed, 2) * 2.6;
-    case 'field': return island + fbm(x, z, 0.009, seed, 2) * 1.4;
-    case 'hills': return island + fbm(x, z, 0.013, seed, 3) * 7;
-    case 'mountains': return island + ridged(x, z, seed, 0.016, 4) * 46 + 20;
+    case 'forest': return island + fbm(x, z, 0.012, seed, 3) * 2.6 + fbm(x, z, 0.045, seed + 50, 2) * 0.9; // 林冠のでこぼこ
+    case 'pasture': return island + fbm(x, z, 0.011, seed, 2) * 1.8; // 草地のゆるい起伏
+    case 'field': return island + fbm(x, z, 0.009, seed, 2) * 0.8; // 畑はなだらか
+    case 'hills': return island + fbm(x, z, 0.013, seed, 3) * 3.6; // 採掘場の段差(控えめ)
+    case 'mountains': return island + ridged(x, z, seed, 0.016, 4) * 34 + 22; // 山だけ急(尾根・崖)
     case 'desert': {
       const a = 0.4, rx = x * Math.cos(a) - z * Math.sin(a);
-      return island + Math.sin(rx * 0.02 + seed) * 2.6 + fbm(x, z, 0.035, seed + 7, 2) * 1.1;
+      return island + Math.sin(rx * 0.02 + seed) * 1.6 + fbm(x, z, 0.035, seed + 7, 2) * 0.7; // 風紋
     }
-    default: return island + fbm(x, z, 0.015, seed, 2) * 2.5; // gold/castle/pitch/lake/fogなど拡張の特殊地形
+    default: return island + fbm(x, z, 0.015, seed, 2) * 1.6; // gold/castle/pitch/lake/fogなど拡張の特殊地形
   }
+}
+function terrainIdOf(terrain) { const i = TERRAIN_NAMES.indexOf(terrain); return i >= 0 ? i : 1; } // 不明な地形はpasture代用
+
+function closestOnSeg(px, pz, seg) {
+  const dx = seg.x2 - seg.x1, dz = seg.z2 - seg.z1;
+  const len2 = dx * dx + dz * dz || 1;
+  let t = ((px - seg.x1) * dx + (pz - seg.z1) * dz) / len2;
+  t = clampUnit(t);
+  return { x: seg.x1 + dx * t, z: seg.z1 + dz * t };
+}
+// 最寄りの海岸線分までの「海側への」符号つき距離(+:海側 / -:陸側)とその海岸のスタイル
+function shoreSigned(field, x, z) {
+  let best = Infinity, bestSeg = null, bestPt = null;
+  for (const seg of field.shoreSegs) {
+    const pt = closestOnSeg(x, z, seg);
+    const d = Math.hypot(x - pt.x, z - pt.z);
+    if (d < best) { best = d; bestSeg = seg; bestPt = pt; }
+  }
+  if (!bestSeg) return { seaward: -9999, style: 'beach' };
+  const seaward = (x - bestPt.x) * bestSeg.nx + (z - bestPt.z) * bestSeg.nz;
+  return { seaward, style: bestSeg.style };
 }
 
 // ================================================================
 // 地形フィールド: hex配置から、任意の(x,z)の高さ・地形・材質ブレンド係数を求める準備をする。
-// マス中心ほど地形らしさ(起伏)を強め、境目(アポセム付近)はLAND_BASE寄りに減衰させてなじませる。
-// 水マスは、陸にいちばん近いマスからの距離で「渚のすぐ沖は浅く、沖は深く」を作る。
-// 海岸線は、水マス側の判定距離だけにノイズを足して不規則にする(陸マス同士の境目はそのまま)。
+// 「陸どうしの境目」と「本物の海岸線」を別の仕組みで扱うのが肝:
+//   - 陸どうしの境目は、最寄り2マスの起伏をHEX_BLEND(数m)だけ混ぜるだけ。高さの基準(LAND_BASE)は
+//     常に同じなので、内陸はどこまでも地続き(浮き島にならない)。
+//   - 海岸線は、本当に海に面した辺(盤の外周、または水マスに接する辺)だけを集めた線分群までの
+//     符号つき距離で決める。マスごとの円形の渚ではなく、島の輪郭そのものに沿う。
 // ================================================================
 function buildTerrainField(g) {
   const hexes = g.hexes;
   const centers = hexes.map((h) => { const [cx, cz] = hexCenterOf(g, h); return { cx, cz }; });
   const isWater = hexes.map((h) => WATER_LIKE.has(h.terrain));
   const seed = hexes.map((h) => h.id * 2654435761 % 100000);
-  // 陸マスのうち、水マス(または盤の外周=hexIds.length===1の辺)に接するものは「海岸」として渚の高さへ減衰させる
-  const coastal = hexes.map((h, i) => {
-    if (isWater[i]) return false;
-    return (h.edgeIds || []).some((eId) => {
+  const coastStyleOf = hexes.map((h) => (hexRng(h.id * 131 + 7)(0, 1) < 0.72 ? 'beach' : 'cliff'));
+  const shoreSegs = [];
+  hexes.forEach((h, i) => {
+    if (isWater[i]) return;
+    (h.edgeIds || []).forEach((eId) => {
       const e = g.edges[eId];
-      return e.hexIds.length < 2 || e.hexIds.some((hid) => WATER_LIKE.has(g.hexes[hid].terrain));
+      const isShore = e.hexIds.length < 2 || e.hexIds.some((hid) => WATER_LIKE.has(g.hexes[hid].terrain));
+      if (!isShore) return;
+      const v1 = g.vertices[e.v1], v2 = g.vertices[e.v2];
+      const x1 = v1.x * SCALE, z1 = v1.y * SCALE, x2 = v2.x * SCALE, z2 = v2.y * SCALE;
+      const mx = (x1 + x2) / 2, mz = (z1 + z2) / 2;
+      let nx = mx - centers[i].cx, nz = mz - centers[i].cz;
+      const len = Math.hypot(nx, nz) || 1;
+      shoreSegs.push({ x1, z1, x2, z2, nx: nx / len, nz: nz / len, style: coastStyleOf[i] });
     });
   });
-  const coastStyle = hexes.map((h, i) => (coastal[i] ? (hexRng(h.id * 131 + 7)(0, 1) < 0.72 ? 'beach' : 'cliff') : 'beach'));
-  return { hexes, centers, isWater, seed, coastal, coastStyle };
+  return { hexes, centers, isWater, seed, shoreSegs };
 }
 
-// (height, terrainIdxForMaterial) を返す。terrainIdxForMaterialは地形メッシュの材質グループ分けに使う
+// 任意の(x,z)の高さ・材質ブレンド係数を返す。
 function sampleTerrain(field, x, z) {
-  const { hexes, centers, isWater, seed, coastal, coastStyle } = field;
-  let bestI = -1, bestD = Infinity;
-  const jitter = coastNoise(x, z); // -1..1。水マスの距離だけをこれで揺らし、海岸線を不規則にする
+  const { hexes, centers } = field;
+  // 最寄りと2番目に近いマス(陸どうしの境目の材質・起伏ブレンドに使う)
+  let i1 = -1, d1 = Infinity, i2 = -1, d2 = Infinity;
   for (let i = 0; i < hexes.length; i++) {
     const c = centers[i];
-    let d = Math.hypot(x - c.cx, z - c.cz);
-    if (isWater[i]) d -= jitter * HEX_A * 0.38;
-    if (d < bestD) { bestD = d; bestI = i; }
+    const dd = Math.hypot(x - c.cx, z - c.cz);
+    if (dd < d1) { d2 = d1; i2 = i1; d1 = dd; i1 = i; } else if (dd < d2) { d2 = dd; i2 = i; }
   }
-  const hex = hexes[bestI];
-  if (isWater[bestI]) {
-    // 陸にいちばん近い点までの距離(ジッターなし)で浅瀬/沖を決める
-    let nearestLand = Infinity;
-    for (let i = 0; i < hexes.length; i++) {
-      if (isWater[i]) continue;
-      nearestLand = Math.min(nearestLand, Math.hypot(x - centers[i].cx, z - centers[i].cz));
-    }
-    const shoreDist = Math.max(0, nearestLand - HEX_A);
-    const depthFactor = smoothstep(0, HEX_A * 1.6, shoreDist);
-    const h = lerp(SHELF, SEABED, depthFactor) + fbm(x, z, 0.02, 500, 2) * 2.5;
-    return { height: h, hex, terrain: hex.terrain, isWater: true };
+  if (i2 < 0) i2 = i1;
+  const hex1 = hexes[i1], hex2 = hexes[i2];
+  const bump1 = field.isWater[i1] ? 0 : terrainBump(hex1.terrain, x, z, field.seed[i1]);
+  const bump2 = field.isWater[i2] ? 0 : terrainBump(hex2.terrain, x, z, field.seed[i2]);
+  const mixT = smoothstep(-HEX_BLEND, HEX_BLEND, d2 - d1); // 1: hex1が優勢
+  const bump = lerp(bump2, bump1, mixT);
+  const landH = LAND_BASE + bump;
+
+  const shore = shoreSigned(field, x, z);
+  const inward = -shore.seaward + coastNoise(x, z) * COAST_JITTER; // +:陸側 -:海側
+  const coastTarget = shore.style === 'cliff' ? -8 : SHELF;
+
+  let height, isWaterPt;
+  if (inward >= COAST_BAND) {
+    height = landH; isWaterPt = false;
+  } else if (inward >= 0) {
+    height = lerp(coastTarget, landH, smoothstep(0, COAST_BAND, inward));
+    isWaterPt = false;
+  } else {
+    height = lerp(coastTarget, SEABED, smoothstep(0, DEEP_BAND, -inward)) + fbm(x, z, 0.02, 500, 2) * 2.2;
+    isWaterPt = true;
   }
-  const r = bestD / HEX_A;
-  const core = 1 - smoothstep(BOUNDARY_LO, BOUNDARY_HI, r); // 1:マス中心 → 0:境目
-  const bump = terrainBump(hex.terrain, x, z, seed[bestI]);
-  let boundaryTarget = LAND_BASE;
-  let beachCoast = false;
-  if (coastal[bestI]) {
-    const style = coastStyle[bestI];
-    if (style === 'cliff') {
-      const rt = smoothstep(0.62, 1.0, r); // 崖: 急に落ちる(斜面判定で岩肌になってよい、むしろ狙い)
-      boundaryTarget = lerp(LAND_BASE, -13, Math.pow(rt, 2.2));
-    } else {
-      // 砂浜: 傾斜がゆるくなるよう、広い範囲でなだらかに渚へ落とす(急だと岩肌判定に化けてしまう)
-      const rt = smoothstep(0.42, 1.3, r);
-      boundaryTarget = lerp(LAND_BASE, SHELF, rt);
-      beachCoast = rt > 0.08;
-    }
-  }
-  const h = LAND_BASE + bump * core + (boundaryTarget - LAND_BASE) * (1 - core);
-  return { height: h, hex, terrain: hex.terrain, isWater: false, core, beachCoast };
+  return {
+    height, isWater: isWaterPt,
+    terrainIdA: terrainIdOf(hex1.terrain), terrainIdB: terrainIdOf(hex2.terrain), mixT,
+    coastStyle: shore.style, coastT: clampUnit(1 - inward / COAST_BAND), // 0:内陸 1:渚(砂/岩のブレンドの強さ)
+  };
 }
 
 // マス中心の高さ(小物を置く基準の高さ)。地形メッシュを作るたびに作り直す
@@ -443,51 +480,83 @@ function terrainTextures(name) {
   terrainTexCache.set(name, out);
   return out;
 }
-// スケール違いの2層(1枚目をそのまま、2枚目は少し拡大+オフセット)をワールド座標のノイズでずらし混ぜ、
-// 同じ模様の繰り返しが目立たないようにする(map_fragmentだけ差し替え。法線/ARMは単純タイリングのまま)。
-function addDetailBlend(material) {
-  material.onBeforeCompile = (shader) => {
+// ================================================================
+// 陸地材質(1枚のシェーダで全地形をまかなう): 頂点ごとに持つ terrainA/terrainB/mixT(隣り合う2マスの
+// 地形とその混ざり具合)・slope(頂点法線の傾き。0=平ら〜1=垂直)・coastW(渚の砂への寄せ具合)を
+// フラグメントシェーダへ渡し、6種の地形テクスチャから選んで混ぜる。
+// スケール違いの2層(そのまま/少し拡大+オフセット)をUV由来のハッシュノイズで混ぜ、繰り返しを消す。
+// 斜面の岩肌への切り替え(slope)は、ここでだけ smoothstep(SLOPE_LO, SLOPE_HI, ...) にして
+// 三角形単位のカクつきが出ないようにする(ブリーフの要求そのもの)。
+// ponytail: 法線マップ・ARM(AO/粗さ)は地形ごとのブレンドまではせず、共有の1枚(pasture)を使い回す。
+// 質感の違いがもっと欲しくなったら、ここに同じ6分岐のブレンドを足す(diffuseと同じやり方でできる)。
+// ================================================================
+function buildLandMaterial() {
+  const sets = TERRAIN_NAMES.map((n) => terrainTextures(n));
+  sets.forEach((tx) => { tx.map.repeat.set(1, 1); });
+  const sharedNormal = sets[1].normalMap; // pastureの法線を共有(リピートは細かめ)
+  sharedNormal.repeat.set(5, 5);
+  const mat = new THREE.MeshStandardMaterial({ normalMap: sharedNormal, roughness: 0.95, metalness: 0.02 });
+  mat.onBeforeCompile = (shader) => {
+    TERRAIN_NAMES.forEach((_, i) => { shader.uniforms['uTex' + i] = { value: sets[i].map }; });
     shader.vertexShader = shader.vertexShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPosDetail;')
-      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWorldPosDetail = (modelMatrix * vec4(transformed, 1.0)).xyz;');
+      .replace('#include <common>', `#include <common>
+        attribute float terrainA; attribute float terrainB; attribute float mixT; attribute float slope; attribute float coastW;
+        varying float vTerrainA; varying float vTerrainB; varying float vMixT; varying float vSlope; varying float vCoastW;
+        varying vec2 vTerrainUv;`)
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        vTerrainA = terrainA; vTerrainB = terrainB; vMixT = mixT; vSlope = slope; vCoastW = coastW; vTerrainUv = uv;`);
     shader.fragmentShader = shader.fragmentShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vWorldPosDetail;\nfloat detailHash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }')
+      .replace('#include <common>', `#include <common>
+        varying float vTerrainA; varying float vTerrainB; varying float vMixT; varying float vSlope; varying float vCoastW;
+        varying vec2 vTerrainUv;
+        ${TERRAIN_NAMES.map((_, i) => `uniform sampler2D uTex${i};`).join('\n        ')}
+        float detailHash(vec2 p){ return fract(sin(dot(p, vec2(12.9898,78.233))) * 43758.5453); }
+        // 地形ごとの狙った色味へ寄せる(元のCC0テクスチャの素の色だけでは地形が読み分けにくいため)。
+        // テクスチャの濃淡(ディテール)は保ちつつ、色相だけtintへ引っ張る軽いmix。
+        vec3 terrainTint(int id) {
+          if (id == 0) return vec3(0.145, 0.235, 0.130); // forest: 濃い緑
+          if (id == 1) return vec3(0.420, 0.560, 0.260); // pasture: 牧草の緑
+          if (id == 2) return vec3(0.760, 0.610, 0.220); // field: 麦の金色
+          if (id == 3) return vec3(0.620, 0.330, 0.190); // hills: 赤茶の粘土
+          if (id == ${ROCK_ID}) return vec3(0.520, 0.510, 0.520); // mountains: 灰色の岩
+          return vec3(0.820, 0.735, 0.520); // desert: 明るい砂
+        }
+        vec4 sampleTerrainTex(int id, vec2 uv) {
+          vec2 uvB = uv * 2.63 + vec2(17.0, 31.0);
+          float n = detailHash(floor(uv * 6.0));
+          float w = smoothstep(0.35, 0.65, n);
+          vec4 tex = texture2D(uTex1, uv);
+          ${TERRAIN_NAMES.map((_, i) => `if (id == ${i}) tex = mix(texture2D(uTex${i}, uv), texture2D(uTex${i}, uvB), w);`).join('\n          ')}
+          float luma = dot(tex.rgb, vec3(0.299, 0.587, 0.114));
+          vec3 toned = mix(vec3(luma), tex.rgb, 0.35) * terrainTint(id) * 1.9;
+          return vec4(toned, tex.a);
+        }`)
       .replace('#include <map_fragment>', `
-      {
-        vec2 uvA = vMapUv;
-        vec2 uvB = vMapUv * 2.63 + vec2(17.0, 31.0);
-        float n = detailHash(floor(vWorldPosDetail.xz * 0.04));
-        vec4 sampledA = texture2D( map, uvA );
-        vec4 sampledB = texture2D( map, uvB );
-        vec4 sampledDiffuseColor = mix( sampledA, sampledB, smoothstep(0.35, 0.65, n) );
-        #ifdef DECODE_VIDEO_TEXTURE
-          sampledDiffuseColor = sRGBTransferEOTF( sampledDiffuseColor );
-        #endif
-        diffuseColor *= sampledDiffuseColor;
-      }`);
+        {
+          vec2 uv = vTerrainUv;
+          vec4 base = mix(sampleTerrainTex(int(vTerrainB + 0.5), uv), sampleTerrainTex(int(vTerrainA + 0.5), uv), vMixT);
+          base = mix(base, sampleTerrainTex(${SAND_ID}, uv), vCoastW);
+          float slopeW = smoothstep(${SLOPE_LO.toFixed(2)}, ${SLOPE_HI.toFixed(2)}, vSlope);
+          base = mix(base, sampleTerrainTex(${ROCK_ID}, uv), slopeW);
+          #ifdef DECODE_VIDEO_TEXTURE
+            base = sRGBTransferEOTF(base);
+          #endif
+          diffuseColor *= base;
+        }`);
   };
-}
-function getTerrainMaterial(name, repeat) {
-  if (TERRAIN_MAT[name]) return TERRAIN_MAT[name];
-  const tx = terrainTextures(name);
-  [tx.map, tx.normalMap, tx.arm].forEach((t) => t.repeat.set(repeat, repeat));
-  const mat = new THREE.MeshStandardMaterial({
-    map: tx.map, normalMap: tx.normalMap, aoMap: tx.arm, roughnessMap: tx.arm, metalnessMap: tx.arm,
-    roughness: 1, metalness: 0.15, vertexColors: true,
-  });
-  addDetailBlend(mat);
-  TERRAIN_MAT[name] = mat;
   return mat;
 }
 // 海底(水マスの地形。ほとんど海に隠れるが、渚の近くは海越しにうっすら見える)
 function getSeabedMaterial() {
   if (TERRAIN_MAT.seabed) return TERRAIN_MAT.seabed;
   const tx = terrainTextures('desert'); // 砂の法線だけ借りる(色は塗りつぶしで海底らしい暗さにする)
-  const mat = new THREE.MeshStandardMaterial({ color: 0x1f4650, normalMap: tx.normalMap, roughness: 0.95, vertexColors: true });
+  const mat = new THREE.MeshStandardMaterial({ color: 0x1f4650, normalMap: tx.normalMap, roughness: 0.95 });
   mat.normalMap.repeat.set(3, 3);
   TERRAIN_MAT.seabed = mat;
   return mat;
 }
+let landMaterial = null;
+function getLandMaterial() { if (!landMaterial) landMaterial = buildLandMaterial(); return landMaterial; }
 
 // 数字チップの文字を書いた円いテクスチャ（出目ごとにキャッシュ）
 const numberTexCache = new Map();
@@ -513,9 +582,10 @@ function numberTexture(n, hot) {
 }
 
 // ================================================================
-// 地形メッシュ本体: 盤を覆う矩形の細かいグリッドを作り、各頂点の高さ・材質を決めて、
-// 地形ごとにジオメトリグループへ振り分ける(1メッシュ・材質配列、描画はグループ単位)。
-// 斜面(法線がかなり横向き)は、地形に関わらず岩肌(mountains)の材質に差し替える。
+// 地形メッシュ本体: 盤を覆う矩形の細かいグリッド(1枚の連続した面)を作り、各頂点の高さと
+// 材質ブレンド係数(terrainA/terrainB/mixT/coastW)を決める。陸と海底だけ描画グループを分け(境は
+// 本物の海岸線)、陸はすべて1つのシェーダ(buildLandMaterial)で描く。斜面の岩肌への切り替えは
+// 三角形単位ではなく、法線から求めたslopeをフラグメントシェーダでsmoothstepするので滑らか。
 // ================================================================
 function buildTerrainMesh(g, field) {
   let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
@@ -531,10 +601,13 @@ function buildTerrainMesh(g, field) {
   const count = nx * nz;
   const pos = new Float32Array(count * 3);
   const uv = new Float32Array(count * 2);
-  const color = new Float32Array(count * 3);
-  const terrainOf = new Array(count); // 地形名(材質の振り分けに使う。後で斜面判定により上書きすることがある)
-  const beachOf = new Array(count); // 砂浜の渚への下り(急だが岩肌にはしたくない)かどうか
-  const UV_SCALE = 1 / (HEX_A * 1.1);
+  const terrainA = new Float32Array(count);
+  const terrainB = new Float32Array(count);
+  const mixT = new Float32Array(count);
+  const coastW = new Float32Array(count);
+  const slope = new Float32Array(count); // computeVertexNormals後に埋める
+  const isWaterAt = new Uint8Array(count);
+  const UV_SCALE = 1 / 14; // 実物の縮尺でタイルが大きく見えすぎない細かさ
 
   for (let j = 0; j < nz; j++) {
     for (let i = 0; i < nx; i++) {
@@ -543,10 +616,9 @@ function buildTerrainMesh(g, field) {
       const k = j * nx + i;
       pos[k * 3] = x; pos[k * 3 + 1] = s.height; pos[k * 3 + 2] = z;
       uv[k * 2] = x * UV_SCALE; uv[k * 2 + 1] = z * UV_SCALE;
-      const shade = s.isWater ? 1 : lerp(0.82, 1.0, s.core ?? 1); // マスの境目をわずかに暗く落として縫い目をなじませる
-      color[k * 3] = color[k * 3 + 1] = color[k * 3 + 2] = shade;
-      terrainOf[k] = s.isWater ? 'seabed' : (TERRAIN_SET[s.terrain] ? s.terrain : 'pasture');
-      beachOf[k] = !!s.beachCoast;
+      terrainA[k] = s.terrainIdA; terrainB[k] = s.terrainIdB; mixT[k] = s.mixT;
+      coastW[k] = (!s.isWater && s.coastStyle === 'beach') ? s.coastT : 0;
+      isWaterAt[k] = s.isWater ? 1 : 0;
     }
   }
   const index = [];
@@ -559,47 +631,31 @@ function buildTerrainMesh(g, field) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   geo.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
-  geo.setAttribute('uv2', new THREE.BufferAttribute(uv, 2)); // aoMapはuv2を読むため(同じ座標でよい)
-  geo.setAttribute('color', new THREE.BufferAttribute(color, 3));
+  geo.setAttribute('terrainA', new THREE.BufferAttribute(terrainA, 1));
+  geo.setAttribute('terrainB', new THREE.BufferAttribute(terrainB, 1));
+  geo.setAttribute('mixT', new THREE.BufferAttribute(mixT, 1));
+  geo.setAttribute('coastW', new THREE.BufferAttribute(coastW, 1));
+  geo.setAttribute('slope', new THREE.BufferAttribute(slope, 1));
 
-  // 三角形ごとの地形を、2頂点以上一致する方を採用して決め、斜面はmountains(岩肌)に差し替える
-  const triTerrain = [];
-  const up = new THREE.Vector3(0, 1, 0);
-  const pA = new THREE.Vector3(), pB = new THREE.Vector3(), pC = new THREE.Vector3(), eAB = new THREE.Vector3(), eAC = new THREE.Vector3(), fn = new THREE.Vector3();
+  // 陸(1グループ=自前シェーダ)と海底(渚の近くでうっすら見えるだけの簡素な材質)の2グループに分ける。
+  // 境目は頂点ごとのisWater(本物の海岸線で決まる)で、陸マスどうしの境目はどこにも生まれない。
+  const landIdx = [], seaIdx = [];
   for (let t = 0; t < index.length; t += 3) {
-    const ia = index[t], ib = index[t + 1], ic = index[t + 2];
-    pA.set(pos[ia * 3], pos[ia * 3 + 1], pos[ia * 3 + 2]);
-    pB.set(pos[ib * 3], pos[ib * 3 + 1], pos[ib * 3 + 2]);
-    pC.set(pos[ic * 3], pos[ic * 3 + 1], pos[ic * 3 + 2]);
-    eAB.subVectors(pB, pA); eAC.subVectors(pC, pA);
-    fn.crossVectors(eAB, eAC).normalize();
-    const steep = fn.angleTo(up) > (QUALITY === 'high' ? 0.55 : 0.62); // ラジアン(約32〜35度)を超える斜面
-    let terrain = terrainOf[ia];
-    const isBeach = beachOf[ia] && beachOf[ib] && beachOf[ic];
-    if (terrain !== 'seabed' && steep && terrain !== 'mountains' && !isBeach) terrain = 'mountains';
-    if (isBeach && terrain !== 'seabed') terrain = 'desert'; // 砂浜は渚まで傾斜があっても砂のまま(岩肌にしない)
-    triTerrain.push(terrain);
+    const ia = index[t];
+    (isWaterAt[ia] ? seaIdx : landIdx).push(index[t], index[t + 1], index[t + 2]);
   }
-  // 材質ごとにインデックスをまとめ直し、geometry.groupsで1描画ずつに分ける
-  const byTerrain = new Map();
-  triTerrain.forEach((terrain, ti) => {
-    if (!byTerrain.has(terrain)) byTerrain.set(terrain, []);
-    byTerrain.get(terrain).push(index[ti * 3], index[ti * 3 + 1], index[ti * 3 + 2]);
-  });
-  const newIndex = [];
-  const materials = [];
-  let groupStart = 0;
-  [...byTerrain.keys()].forEach((terrain, gi) => {
-    const idxs = byTerrain.get(terrain);
-    newIndex.push(...idxs);
-    geo.addGroup(groupStart, idxs.length, gi);
-    groupStart += idxs.length;
-    materials.push(terrain === 'seabed' ? getSeabedMaterial() : getTerrainMaterial(terrain, 5));
-  });
+  const newIndex = [...landIdx, ...seaIdx];
+  geo.addGroup(0, landIdx.length, 0);
+  geo.addGroup(landIdx.length, seaIdx.length, 1);
   geo.setIndex(newIndex);
   geo.computeVertexNormals();
 
-  const mesh = new THREE.Mesh(geo, materials);
+  // 法線のy成分(上向き具合)から斜面の急さを求め、頂点属性に書き戻す(フラグメントシェーダでsmoothstep)
+  const normalAttr = geo.attributes.normal;
+  for (let k = 0; k < count; k++) slope[k] = clampUnit(1 - normalAttr.getY(k));
+  geo.attributes.slope.needsUpdate = true;
+
+  const mesh = new THREE.Mesh(geo, [getLandMaterial(), getSeabedMaterial()]);
   mesh.receiveShadow = true;
   mesh.castShadow = true;
   return mesh;
@@ -611,6 +667,34 @@ function buildTerrainMesh(g, field) {
 // three.jsのWater.js(ミラー反射)は毎フレームの2回描画が重く、深さの色分けにも向かないため、
 // 自前のShaderMaterialにする(ブリーフにある代替案のとおり)。
 // ================================================================
+// 地形メッシュの高さをDataTexture(1チャンネル)に焼く。海のシェーダはこれを読んで「本当の渚からの深さ」で
+// 色を変える(原点からの距離の代用はやめた)。範囲外(テクスチャの外)はClampToEdgeで端の値(=深い海)を使う。
+const HBAKE_RES = 192;
+const HBAKE_MIN = -34, HBAKE_MAX = 40; // この範囲に高さを正規化してR8に詰める(陸の奥は飽和してよい)
+function buildHeightTexture(field) {
+  let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+  field.centers.forEach(({ cx, cz }) => {
+    minX = Math.min(minX, cx); maxX = Math.max(maxX, cx); minZ = Math.min(minZ, cz); maxZ = Math.max(maxZ, cz);
+  });
+  const pad = HEX_R + DEEP_BAND * 1.3;
+  minX -= pad; maxX += pad; minZ -= pad; maxZ += pad;
+  const data = new Uint8Array(HBAKE_RES * HBAKE_RES);
+  for (let j = 0; j < HBAKE_RES; j++) {
+    for (let i = 0; i < HBAKE_RES; i++) {
+      const x = minX + (i + 0.5) / HBAKE_RES * (maxX - minX);
+      const z = minZ + (j + 0.5) / HBAKE_RES * (maxZ - minZ);
+      const h = sampleTerrain(field, x, z).height;
+      const t = clampUnit((h - HBAKE_MIN) / (HBAKE_MAX - HBAKE_MIN));
+      data[j * HBAKE_RES + i] = Math.round(t * 255);
+    }
+  }
+  const tex = new THREE.DataTexture(data, HBAKE_RES, HBAKE_RES, THREE.RedFormat, THREE.UnsignedByteType);
+  tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
+  tex.minFilter = tex.magFilter = THREE.LinearFilter;
+  tex.needsUpdate = true;
+  return { tex, origin: new THREE.Vector2(minX, minZ), size: new THREE.Vector2(maxX - minX, maxZ - minZ) };
+}
+
 function buildOcean(g, field) {
   let maxR = 0;
   field.centers.forEach(({ cx, cz }) => { maxR = Math.max(maxR, Math.hypot(cx, cz) + HEX_R); });
@@ -619,15 +703,19 @@ function buildOcean(g, field) {
   const geo = new THREE.PlaneGeometry(size, size, seg, seg);
   geo.rotateX(-Math.PI / 2);
 
+  const heightBake = buildHeightTexture(field);
   const uniforms = {
     uTime: { value: 0 },
     uShallow: { value: new THREE.Color(0x2fb896) }, // 浅瀬エメラルド
     uDeep: { value: new THREE.Color(0x0a2f52) }, // 沖の濃紺
     uFoam: { value: new THREE.Color(0xf3fbff) },
-    uSunDir: { value: new THREE.Vector3(260, 480, 180).normalize() },
+    uHeightTex: { value: heightBake.tex },
+    uHOrigin: { value: heightBake.origin },
+    uHSize: { value: heightBake.size },
   };
   oceanUniforms = uniforms;
   const mat = new THREE.MeshStandardMaterial({ color: 0x1a4a66, roughness: 0.25, metalness: 0.05, dithering: true });
+  mat.userData.heightTex = heightBake.tex; // rebuild時に破棄するため覚えておく
   mat.onBeforeCompile = (shader) => {
     Object.assign(shader.uniforms, uniforms);
     shader.vertexShader = shader.vertexShader
@@ -640,19 +728,20 @@ function buildOcean(g, field) {
     shader.fragmentShader = shader.fragmentShader
       .replace('#include <common>', `#include <common>
         uniform vec3 uShallow; uniform vec3 uDeep; uniform vec3 uFoam; uniform float uTime;
+        uniform sampler2D uHeightTex; uniform vec2 uHOrigin; uniform vec2 uHSize;
         varying vec3 vWorldPosOcean;`)
       .replace('#include <map_fragment>', `
         {
-          // 渚からの距離が分からないので、原点(島)からの距離を目安の深さにする(簡易版)。
-          // ponytail: hexごとの本当の渚からの距離ではないため、島に近いマスほど実際より広く浅瀬色が伸びる。
-          // ちゃんと渚までの距離を使うなら、地形メッシュの高さマップをテクスチャに焼いて渡す(②以降の候補)。
-          float distFromCenter = length(vWorldPosOcean.xz);
-          float depth = smoothstep(${(maxR * 0.8).toFixed(1)}, ${(maxR * 2.3).toFixed(1)}, distFromCenter);
-          vec3 base = mix(uShallow, uDeep, depth);
-          // 渚のすぐそば(depthがほぼ0)だけ、なめらかに白く明るませて泡の気配にする(硬いノイズは使わない)
-          float shallowEdge = 1.0 - smoothstep(0.0, 0.1, depth);
+          vec2 huv = (vWorldPosOcean.xz - uHOrigin) / uHSize;
+          float raw = texture2D(uHeightTex, clamp(huv, 0.0, 1.0)).r;
+          float h = mix(${HBAKE_MIN.toFixed(1)}, ${HBAKE_MAX.toFixed(1)}, raw);
+          float depth = max(0.0, -h); // 海面(0)より下の深さ
+          float depthT = smoothstep(0.0, 24.0, depth);
+          vec3 base = mix(uShallow, uDeep, depthT);
+          // 渚のすぐそば(depthがほぼ0)に白い泡の線。硬いノイズは使わず、なめらかに揺らす
+          float foam = 1.0 - smoothstep(0.0, 2.2, depth);
           float shimmer = 0.75 + 0.25 * sin(vWorldPosOcean.x * 0.05 + vWorldPosOcean.z * 0.07 + uTime * 1.2);
-          base = mix(base, uFoam, shallowEdge * 0.35 * shimmer);
+          base = mix(base, uFoam, foam * shimmer);
           diffuseColor.rgb *= base;
         }`);
   };
@@ -672,7 +761,11 @@ function boardSig(g) { return g.hexes.length + ':' + g.hexes.map((h) => h.terrai
 
 function rebuildTerrainAndOcean(g) {
   if (terrainGroup) { scene.remove(terrainGroup); disposeDeep(terrainGroup); }
-  if (oceanMesh) { scene.remove(oceanMesh); disposeDeep(oceanMesh); }
+  if (oceanMesh) {
+    scene.remove(oceanMesh); disposeDeep(oceanMesh);
+    if (oceanMesh.material.userData.heightTex) oceanMesh.material.userData.heightTex.dispose();
+    oceanMesh.material.dispose();
+  }
   const field = buildTerrainField(g);
   hexHeight = computeHexHeights(g, field);
   terrainGroup = buildTerrainMesh(g, field);
