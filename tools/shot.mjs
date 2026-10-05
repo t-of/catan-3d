@@ -85,7 +85,7 @@ function cameraPresets(game, cityVertex) {
   const dist = maxR * 1.9;
   return {
     default: { pos: [0, dist * 0.78, dist * 0.68], tgt: [0, 0, 0] },
-    close: { pos: [cx + 120, 95, cz + 150], tgt: [cx, 10, cz] }, // 都市の集落が大きく見える程度の寄り
+    close: { pos: [cx + 50, 90, cz + 50], tgt: [cx, 8, cz] }, // 斜め上約50°から集落を見下ろす寄り
     low45: { pos: [dist * 0.74, dist * 0.30, dist * 0.74], tgt: [0, 0, 0] }, // 低め斜め45度
   };
 }

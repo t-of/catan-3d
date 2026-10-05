@@ -133,7 +133,6 @@ const GEO = {
   dryGrass: lumpy(new THREE.SphereGeometry(0.4, 6, 4), 0.3, 7).scale(1, 0.5, 1),
   desertRock: smoothGeo(lumpy(new THREE.SphereGeometry(0.8, 7, 5), 0.3, 11)).scale(1, 0.55, 1),
   nugget: new THREE.OctahedronGeometry(3.4, 0),
-  road: new THREE.CylinderGeometry(3.4, 3.4, 1, 8), // 角を落とした木の棒(断面が八角形の丸太)。長さはmeshのscale.yで伸ばす
   dockPlank: new THREE.BoxGeometry(2.2, 0.4, 1.3),
   boatHull: new THREE.BoxGeometry(7, 2, 2.6),
   boatSail: new THREE.ConeGeometry(1.6, 3.6, 3),
@@ -142,8 +141,61 @@ const GEO = {
   wallStone: new THREE.BoxGeometry(1.05, 0.75, 0.8), // 石垣の一区切り
   pathTile: new THREE.BoxGeometry(1.1, 0.1, 2.0), // 土の農道
   streamTile: new THREE.BoxGeometry(1.1, 0.06, 1.5), // 細い小川
+
+  // ---- ④: 建物・道・持ち主の色。高さはgeometry.translate()で焼き込み、1単位≒2.5mの縮尺 ----
+  // (④の直し: 既定のカメラから誰の建物・道か分かるよう、旗・標柱・道幅を実物よりはっきり大きくしている)
+  housePlinth: new THREE.BoxGeometry(3.8, 0.5, 3.8).translate(0, 0.25, 0), // 石の土台
+  houseWall: new THREE.BoxGeometry(3.2, 2.5, 3.3).translate(0, 0.5 + 1.25, 0), // 石灰・石積みの壁(持ち主色なし)
+  houseShutters: mergeBoxes([ // 雨戸(左右の窓の脇。持ち主の色)
+    [0.22, 0.95, 0.1, -0.95, 0.5 + 1.55, 1.68], [0.22, 0.95, 0.1, 0.95, 0.5 + 1.55, 1.68],
+  ]),
+  houseAwning: new THREE.BoxGeometry(1.7, 0.08, 0.9).translate(0, 0, 0.45).rotateX(-0.32).translate(0, 0.5 + 2.08, 1.55), // 日よけ布(持ち主の色)
+  houseEave: new THREE.BoxGeometry(4.3, 0.26, 4.4).rotateY(Math.PI / 4).translate(0, 0.5 + 2.5 + 0.13, 0),
+  houseRoofTile: new THREE.ConeGeometry(3.0, 2.2, 4, 1).rotateY(Math.PI / 4).translate(0, 0.5 + 2.5 + 0.26 + 1.1, 0), // 瓦
+  houseRoofThatch: lumpy(new THREE.ConeGeometry(3.15, 2.0, 4, 1), 0.07, 11).rotateY(Math.PI / 4).translate(0, 0.5 + 2.5 + 0.26 + 1.0, 0), // 茅葺き
+  houseChimney: new THREE.CylinderGeometry(0.17, 0.22, 1.5, 6).translate(1.1, 0.5 + 2.5 + 2.0, 1.1),
+  flagPole: new THREE.CylinderGeometry(0.14, 0.2, 10.6, 6).translate(0, 5.3, 0),
+  flagCloth: new THREE.BoxGeometry(4.4, 2.6, 0.07, 5, 3).translate(2.3, 9.1, 0), // 分割を入れて風シェーダでしなるように
+  cityWallRing: new THREE.CylinderGeometry(15.6, 16.8, 9.5, 10, 1, true),
+  cityCrenel: new THREE.BoxGeometry(1.15, 1.3, 1.15),
+  cityTower: new THREE.CylinderGeometry(3.7, 4.1, 16, 8),
+  cityTowerRoof: new THREE.ConeGeometry(4.5, 6.4, 8),
+  towerWindow: new THREE.BoxGeometry(0.55, 1.15, 0.26), // 塔の窓(石積みにめり込ませる。暗く+わずかに灯る)
+  churchBody: new THREE.BoxGeometry(6.2, 11, 7.4).translate(0, 5.5, 0),
+  churchRoof: new THREE.CylinderGeometry(0.15, 4.8, 6.8, 4, 1).rotateY(Math.PI / 4).translate(0, 11 + 3.4, 0),
+  churchSpire: new THREE.CylinderGeometry(1.15, 1.5, 3.3, 6).translate(0, 11 + 6.8 + 1.65, 0),
+  churchSpireRoof: new THREE.ConeGeometry(1.55, 3.6, 6).translate(0, 11 + 6.8 + 3.3 + 1.8, 0),
+  roadTile: new THREE.BoxGeometry(12.5, 0.2, 2.6), // 石畳/土の路面(xが道幅、zが道なりの長さ)。幅は見やすさ優先で実物よりだいぶ広い
+  roadRut: new THREE.BoxGeometry(0.6, 0.05, 2.4), // 轍
+  roadPost: new THREE.CylinderGeometry(0.19, 0.27, 5.6, 6).translate(0, 2.8, 0), // 道沿いの標柱(旗のポールより低いが地面からよく見える高さ)
+  roadBanner: new THREE.BoxGeometry(2.7, 1.75, 0.06, 5, 3, 1).translate(1.45, 4.5, 0), // 標柱の布(旗と同じ仕組みでなびく)
+  shipHull: hullGeometry(16, 4.6, 6.4), // 航海者の船(辺に置く)。舳先がとがった船体
+  knightRobe: new THREE.CylinderGeometry(0.85, 1.15, 2.2, 7), // 持ち主の色の外套。上面が平らで、見下ろすカメラでも色がよく見える
+  knightHead: new THREE.SphereGeometry(0.68, 7, 5),
 };
 function smoothGeo(g) { g.computeVertexNormals(); return g; }
+// 複数のBoxGeometryを1つにまとめる(conifer()と同じ要領)。[w,h,d,x,y,z]の配列を受け取り、
+// 位置が離れた箱どうし(例: 家の左右の雨戸)を1つのジオメトリ=1インスタンスとして扱えるようにする。
+function mergeBoxes(specs) {
+  const parts = specs.map(([w, h, d, x, y, z]) => new THREE.BoxGeometry(w, h, d).translate(x, y, z));
+  const pos = [].concat(...parts.map((p) => [...p.attributes.position.array]));
+  let offset = 0;
+  const idx = [].concat(...parts.map((p) => { const a = [...p.index.array.map((v) => v + offset)]; offset += p.attributes.position.count; return a; }));
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setIndex(idx);
+  return smoothGeo(g);
+}
+// 船体: 真上から見て舳先がとがった形(四角い箱のままにしない)。幅wはx、奥行きdはz、高さh
+function hullGeometry(w, h, d) {
+  const shape = new THREE.Shape();
+  const back = -w * 0.46, bow = w * 0.54, side = d / 2;
+  shape.moveTo(back, -side); shape.lineTo(bow, 0); shape.lineTo(back, side); shape.lineTo(back, -side);
+  const geo = new THREE.ExtrudeGeometry(shape, { depth: h, bevelEnabled: false, curveSegments: 1 });
+  geo.rotateX(Math.PI / 2); // extrudeはxy平面+z方向。倒して甲板をxz平面にする
+  geo.translate(0, h / 2, 0);
+  return smoothGeo(geo);
+}
 const MAT = {
   conLeaf: new THREE.MeshStandardMaterial({ color: 0x223a2a, roughness: 0.92 }),
   broadLeaf: new THREE.MeshStandardMaterial({ color: 0x3a5226, roughness: 0.9 }),
@@ -169,7 +221,35 @@ const MAT = {
   wallStone: new THREE.MeshStandardMaterial({ color: 0x9a968c, roughness: 0.95 }),
   path: new THREE.MeshStandardMaterial({ color: 0x8c7752, roughness: 1 }),
   stream: new THREE.MeshStandardMaterial({ color: 0x2c5056, roughness: 0.15, metalness: 0.1 }),
+
+  // ---- ④: 建物・道・持ち主の色 ----
+  housePlinth: new THREE.MeshStandardMaterial({ color: 0xb7b0a0, roughness: 0.95 }), // 石の土台(持ち主色なし)
+  // ④の直し: 壁はどの家も石灰・石積み(白〜生成り〜灰)で統一し、持ち主の色は出さない。
+  // instancedFromのvariance(個体ごとの色ばらつき)だけ使うので、Bに積むとき色は渡さない。
+  houseWall: new THREE.MeshStandardMaterial({ color: 0xcdc3ad, roughness: 0.88 }),
+  houseShutter: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.75 }), // 雨戸(木。白地+instanceColorで持ち主の色)
+  eaveTrim: new THREE.MeshStandardMaterial({ color: 0x6b5a46, roughness: 0.85 }), // 軒(木)
+  roofTile: new THREE.MeshStandardMaterial({ color: 0x8a4a36, roughness: 0.8 }), // 瓦
+  roofThatch: new THREE.MeshStandardMaterial({ color: 0xc8a862, roughness: 0.95 }), // 茅葺き
+  chimney: new THREE.MeshStandardMaterial({ color: 0x8f7a68, roughness: 0.9 }),
+  roadStone: new THREE.MeshStandardMaterial({ color: 0xbaa87c, roughness: 0.92 }), // 道の路面(土/石畳)。地形よりはっきり明るくして見分けやすく
+  roadRut: new THREE.MeshStandardMaterial({ color: 0x4a3a26, roughness: 1 }),
+  knightArmor: new THREE.MeshStandardMaterial({ color: 0x5c606a, roughness: 0.55, metalness: 0.35 }),
+  cloth: new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.82, side: THREE.DoubleSide }), // 旗・布(instanceColorで持ち主の色)
+  towerWindow: new THREE.MeshStandardMaterial({ color: 0x15120d, roughness: 0.7, emissive: 0x3a2710, emissiveIntensity: 0.4 }), // 夕方の灯り
 };
+function buildCityStoneMaterial() { // 城壁・塔は山の岩肌テクスチャを使い回して石積みの質感・色むらを出す(新しい素材を増やさない)。
+  // terrainTextures()のキャッシュ済みテクスチャをclone()すると、まだ画像を読み込み中の場合にimageが
+  // 空のままになる(cloneは参照のスナップショットで、あとから届くonLoadを拾えない)ので、ここだけ
+  // 独自にloadTerrainTex()で読み込み直す(リピート設定が違うので共有もできない。画像はブラウザ側でキャッシュされる)。
+  const map = loadTerrainTex('./textures/mountains_diff.jpg', true);
+  const nor = loadTerrainTex('./textures/mountains_nor.jpg', false);
+  const arm = loadTerrainTex('./textures/mountains_arm.jpg', false);
+  [map, nor, arm].forEach((t) => { t.repeat.set(2.6, 1.3); });
+  const mat = new THREE.MeshStandardMaterial({ map, normalMap: nor, roughnessMap: arm, color: 0xb8b2a0, roughness: 1 });
+  mat.normalScale.set(0.5, 0.5);
+  return mat;
+}
 // 密度は画質(中/高)で数だけ変える(大きさは変えない)。森は詰めすぎても見た目が変わらないので頭打ちにする
 const DENSITY = { mid: 1, high: 3.4 }[QUALITY];
 const FOREST_DENSITY = Math.min(DENSITY, 2.2);
@@ -206,6 +286,55 @@ applyWindSway(MAT.conLeaf, 2.6, 0.06, 1.1, 0.55);
 applyWindSway(MAT.broadLeaf, 1.5, 0.07, 1.0, 0.5);
 applyWindSway(MAT.bush, 0.7, 0.03, 1.3, 0.45);
 applyWindSway(MAT.dryGrass, 0.2, 0.03, 1.6, 0.3);
+
+// 旗・布のなびき(頂点シェーダ)。木の揺れ(position.y基準)と違い、ポールに固定した辺(ローカルx=0)から
+// 遠いほど(x方向)大きく揺れる。vegUniforms.uTimeを共有するので「動き オフ」で一緒に止まる。
+function applyFlagSway(mat, reach) {
+  mat.customProgramCacheKey = () => `flagsway:${reach}`;
+  mat.onBeforeCompile = (shader) => {
+    Object.assign(shader.uniforms, vegUniforms);
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nuniform float uTime;')
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        #ifdef USE_INSTANCING
+          float flagPhase = instanceMatrix[3].x * 0.1 + instanceMatrix[3].z * 0.08;
+        #else
+          float flagPhase = 0.0;
+        #endif
+        float flutter = clamp(position.x / ${reach.toFixed(2)}, 0.0, 1.0);
+        flutter *= flutter;
+        transformed.y += sin(uTime * 2.6 + flutter * 3.1 + flagPhase) * 0.22 * flutter;
+        transformed.z += cos(uTime * 2.1 + flutter * 3.1 + flagPhase) * 0.16 * flutter;`);
+  };
+}
+applyFlagSway(MAT.cloth, 1.2);
+
+// 持ち主の色を「染めた布」くらいの彩度・明るさに落とす(旗・標柱の布・帆に使う。蛍光色にしない)
+function clothColor(colorHex) {
+  const hsl = {};
+  new THREE.Color(colorHex).getHSL(hsl);
+  // ④の直し: 既定のカメラでも誰の色か分かるよう、以前より少しだけ鮮やかに・明るめに許す(蛍光色にはしない)
+  return new THREE.Color().setHSL(hsl.h, Math.min(hsl.s, 0.68), Math.min(Math.max(hsl.l, 0.33), 0.58));
+}
+// instancedでない単体の駒(騎士・船)用に、色ごとの布材質をMATに登録して使い回す(dispose対象から外すため)。
+function clothMaterial(colorHex) {
+  const key = 'cloth_' + new THREE.Color(colorHex).getHexString();
+  if (!MAT[key]) {
+    const m = new THREE.MeshStandardMaterial({ color: clothColor(colorHex), roughness: 0.82, side: THREE.DoubleSide });
+    applyFlagSway(m, 2.3);
+    MAT[key] = m;
+  }
+  return MAT[key];
+}
+function angDiff(a, b) { const d = Math.abs(a - b) % (Math.PI * 2); return d > Math.PI ? Math.PI * 2 - d : d; }
+// 頂点から出ている辺の向き(道がある/できる方角)。集落の家はこの方角を避けて建てる
+function vertexEdgeAngles(g, v) {
+  return v.edgeIds.map((eid) => {
+    const e = g.edges[eid];
+    const other = g.vertices[e.v1 === v.id ? e.v2 : e.v1];
+    return Math.atan2(other.y - v.y, other.x - v.x);
+  });
+}
 const TERRAIN_MAT = {}; // 地形ごとのタイル材質(一度作ったら使い回す)。terrainTextures()の結果と対応
 
 function clampUnit(v) { return Math.min(1, Math.max(0, v)); }
@@ -497,17 +626,22 @@ function flatHexGeometry(pts, y) {
   geo.computeVertexNormals();
   return geo;
 }
+// variance: 材質の色からの色ばらつき(木・岩など)。items[0].colorがあれば代わりにその色をそのまま使う
+// (建物の壁・旗など、持ち主の色をそのまま出したいとき。材質の地色は白にしておく)。
 function instancedFrom(geo, mat, items, variance) {
   if (!items.length) return null;
   const mesh = new THREE.InstancedMesh(geo, mat, items.length);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
-  const hsl = variance ? mat.color.getHSL({}) : null;
+  const exact = !!items[0].color;
+  const hsl = (variance && !exact) ? mat.color.getHSL({}) : null;
   items.forEach((it, i) => {
     e.set(it.rx || 0, it.ry || 0, it.rz || 0);
     q.setFromEuler(e);
     m4.compose(new THREE.Vector3(it.x, it.y, it.z), q, new THREE.Vector3(it.s ?? 1, it.s ?? 1, it.s ?? 1));
     mesh.setMatrixAt(i, m4);
-    if (variance) {
+    if (exact) {
+      mesh.setColorAt(i, it.color);
+    } else if (variance) {
       const r = it.seed != null ? hexRng(it.seed) : rand;
       // instanceColorは材質の色に掛け算される。ずらした色そのものを入れると色が2乗されて真っ黒に近く
       // なる(木・生け垣が黒く見えた原因)ので、材質の色に対する比を入れる。
@@ -519,7 +653,7 @@ function instancedFrom(geo, mat, items, variance) {
   });
   mesh.castShadow = true; mesh.receiveShadow = true;
   mesh.instanceMatrix.needsUpdate = true;
-  if (variance) mesh.instanceColor.needsUpdate = true;
+  if (exact || variance) mesh.instanceColor.needsUpdate = true;
   return mesh;
 }
 function rand(a, b) { return a + Math.random() * (b - a); }
@@ -958,6 +1092,8 @@ function getSeabedMaterial() {
 }
 let landMaterial = null;
 function getLandMaterial() { if (!landMaterial) landMaterial = buildLandMaterial(); return landMaterial; }
+let cityStoneMaterial = null;
+function getCityStoneMaterial() { if (!cityStoneMaterial) cityStoneMaterial = buildCityStoneMaterial(); return cityStoneMaterial; }
 
 // 数字チップの文字を書いた円いテクスチャ（出目ごとにキャッシュ）
 const numberTexCache = new Map();
@@ -1229,7 +1365,9 @@ export function renderBoard3D(game, uiState, overlay) {
 
   // 植生と小物(木・羊・石垣・窯など、数千〜数万個)は盤の形(と霧の晴れ具合)が変わったときだけ作り直す。
   // 毎回作り直すと、1本ごとに地形の高さを引くぶん再描画が重くなるため。
-  const vSig = sig + '|' + g.hexes.map((h) => (h.fog ? 1 : 0)).join('');
+  // 都市(城壁)は植生をCITY_CLEARまで広く空けるので、開拓地→都市の昇格でも植生を作り直す
+  const citySig = g.vertices.map((v) => (v.building && v.building.type === 'city') ? '1' : '0').join('');
+  const vSig = sig + '|' + g.hexes.map((h) => (h.fog ? 1 : 0)).join('') + '|' + citySig;
   if (vSig !== vegSignature) { vegSignature = vSig; rebuildVegetation(g); }
 
   g.hexes.forEach((hex) => {
@@ -1272,7 +1410,14 @@ export function renderBoard3D(game, uiState, overlay) {
     });
   }
 
-  // 道・船
+  // 道・船・建物(④)。路面・壁・旗など数が増えるもの(拡張で頂点・辺が増える)はB(バッチ)にためて
+  // まとめてinstancedMeshにする(増えても描画コストがほぼ変わらない)。都市の城壁・教会など1つしかない
+  // 大物だけ個別のMeshのまま(addShip/addKnight/buildCity内の壁・塔・教会)。
+  const B = {
+    roadTile: [], roadRut: [], roadsideBush: [], signPost: [], banner: [],
+    plinth: [], wall: [], shutter: [], awning: [], eave: [], roofTile: [], roofThatch: [], chimney: [],
+    flagPole: [], flagCloth: [], crenel: [], towerWindow: [],
+  };
   g.edges.forEach((edge) => {
     const v1 = g.vertices[edge.v1], v2 = g.vertices[edge.v2];
     const x1 = v1.x * SCALE, z1 = v1.y * SCALE, x2 = v2.x * SCALE, z2 = v2.y * SCALE;
@@ -1282,28 +1427,38 @@ export function renderBoard3D(game, uiState, overlay) {
     if (edge.ship != null) {
       addShip(mx, mz, ang, game.players[edge.ship].color);
     } else if (edge.road != null) {
-      const color = new THREE.Color(game.players[edge.road].color);
-      const len = Math.hypot(x2 - x1, z2 - z1) * 0.82;
-      // 角を落とした木の棒(断面が八角形の丸太)。GEO.roadは長さ1なので、scale.yで伸ばしてから横向きに倒す
-      const road = new THREE.Mesh(GEO.road, new THREE.MeshStandardMaterial({ color, roughness: 0.85 }));
-      road.scale.set(1, len, 1);
-      const qLay = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), Math.PI / 2);
-      const qTurn = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), ang);
-      road.quaternion.multiplyQuaternions(qTurn, qLay);
-      road.position.set(mx, baseY + 3.4, mz);
-      road.castShadow = true;
-      sceneGroup.add(road);
+      buildRoad(B, x1, z1, x2, z2, baseY, clothColor(game.players[edge.road].color), edge.id, ang);
     }
   });
 
-  // 頂点: 建物
+  // 頂点: 建物(開拓地・都市)
   g.vertices.forEach((v) => {
     if (!v.building) return;
     const x = v.x * SCALE, z = v.y * SCALE;
     const baseY = baseYOfHex(firstHexAt(g, v.hexIds));
-    const color = new THREE.Color(game.players[v.building.owner].color);
-    if (v.building.type === 'city') addCity(x, baseY, z, color); else addHouse(x, baseY, z, color);
+    const cloth = clothColor(game.players[v.building.owner].color);
+    if (v.building.type === 'city') buildCity(B, g, v, x, z, baseY, cloth);
+    else buildSettlement(B, g, v, x, z, baseY, cloth);
   });
+  [
+    instancedFrom(GEO.roadTile, MAT.roadStone, B.roadTile),
+    instancedFrom(GEO.roadRut, MAT.roadRut, B.roadRut),
+    instancedFrom(GEO.bush, MAT.bush, B.roadsideBush, 0.04),
+    instancedFrom(GEO.roadPost, MAT.signPost, B.signPost),
+    instancedFrom(GEO.roadBanner, MAT.cloth, B.banner),
+    instancedFrom(GEO.housePlinth, MAT.housePlinth, B.plinth, 0.03),
+    instancedFrom(GEO.houseWall, MAT.houseWall, B.wall, 0.05), // 持ち主色なし。seedでvariance(白〜生成り〜灰)だけ付く
+    instancedFrom(GEO.houseShutters, MAT.houseShutter, B.shutter),
+    instancedFrom(GEO.houseAwning, MAT.cloth, B.awning),
+    instancedFrom(GEO.houseEave, MAT.eaveTrim, B.eave),
+    instancedFrom(GEO.houseRoofTile, MAT.roofTile, B.roofTile, 0.02),
+    instancedFrom(GEO.houseRoofThatch, MAT.roofThatch, B.roofThatch, 0.03),
+    instancedFrom(GEO.houseChimney, MAT.chimney, B.chimney),
+    instancedFrom(GEO.flagPole, MAT.signPost, B.flagPole),
+    instancedFrom(GEO.flagCloth, MAT.cloth, B.flagCloth),
+    instancedFrom(GEO.cityCrenel, getCityStoneMaterial(), B.crenel, 0.02),
+    instancedFrom(GEO.towerWindow, MAT.towerWindow, B.towerWindow),
+  ].forEach((m) => { if (m) sceneGroup.add(m); });
 
   // 騎士（都市と騎士）・蛮族の騎士（交易と略奪）: 簡素な色付きの駒
   if (game.players[0] && game.players[0].knights) {
@@ -1358,7 +1513,7 @@ function frameCamera(g) {
     const dist = maxR * 1.9;
     camera.position.set(0, dist * 0.78, dist * 0.68);
     controls.target.set(0, 0, 0);
-    controls.minDistance = maxR * 0.5;
+    controls.minDistance = Math.max(45, maxR * 0.15); // ④の直し: 集落1つに寄れる近さまでズームできるようにする
     controls.maxDistance = maxR * 3.2;
     controls.update();
   }
@@ -1481,13 +1636,17 @@ function alongSeg(ax, az, bx, bz, step) {
   return out;
 }
 const CLEAR_R = 19; // 数字の石碑(半径15)のまわりの空き地
-const VERTEX_CLEAR = 12; // 頂点(開拓地・都市・置ける場所の印)のまわり
-const EDGE_CLEAR = 5.5; // 辺(道・置ける場所の印。幅11)からこれだけ内側までは背の高いものを置かない
+const VERTEX_CLEAR = 15; // 頂点(開拓地・都市・置ける場所の印)のまわり。④で集落の半径を広げたぶん合わせて広げた
+const EDGE_CLEAR = 7.2; // 辺(道。幅12.5)からこれだけ内側までは背の高いものを置かない。④で道幅を広げたぶん合わせて広げた
+const CITY_CLEAR = 18; // 都市(城壁)は開拓地より大きいので、実際に都市が建っている頂点だけこの半径まで空ける
 
 function rebuildVegetation(g) {
   if (vegGroup) { disposeGroup(vegGroup); scene.remove(vegGroup); }
   vegGroup = new THREE.Group();
   scene.add(vegGroup);
+  // 都市(城壁)が建っている頂点は、開拓地より広く空ける(CITY_CLEARまで)。他の頂点はいつもどおりVERTEX_CLEAR。
+  const cityVerts = new Set();
+  g.vertices.forEach((v) => { if (v.building && v.building.type === 'city') cityVerts.add(v.id); });
   const V = { con: [], broad: [], bush: [], sheep: [], rock: [], brick: [], scree: [], dryGrass: [], desertRock: [], nugget: [], wall: [], path: [], stream: [] };
   g.hexes.forEach((hex) => {
     const terrain = hex.fog ? 'fog' : hex.terrain;
@@ -1495,8 +1654,9 @@ function rebuildVegetation(g) {
     const [cx, cz] = hexCenterOf(g, hex);
     const height = baseYOfHex(hex);
     const pts = hexPointsOf(g, hex);
+    const vids = hex.vertexIds;
     const rr = hexRng(hex.id * 7919 + 13);
-    const nearVertex = (x, z, r) => pts.some(([vx, vz]) => Math.hypot(x - vx, z - vz) < r);
+    const nearVertex = (x, z, r) => pts.some(([vx, vz], i) => Math.hypot(x - vx, z - vz) < (cityVerts.has(vids[i]) ? Math.max(r, CITY_CLEAR) : r));
     // マスの内側の、空き地・頂点・辺を避けた点をn個ほど選ぶ(足りなければそこまで)
     const scatter = (n, minR, inset, fn) => {
       for (let i = 0, tries = 0; i < n && tries < n * 6; tries++) {
@@ -1617,7 +1777,7 @@ function rebuildVegetation(g) {
       }
     }
   });
-  buildHexBoundaries(g, V);
+  buildHexBoundaries(g, V, cityVerts);
   [
     instancedFrom(GEO.conCanopy, MAT.conLeaf, V.con, 0.035),
     instancedFrom(GEO.broadCanopy, MAT.broadLeaf, V.broad, 0.05),
@@ -1693,20 +1853,23 @@ function addMineAndRail(cx, cz, height, R, rr) {
 }
 // マスの境目(陸どうしの辺)を、隣り合う地形の組み合わせに合った縁取りで描く。海に面した辺(渚)は描かない。
 // 生け垣(低木の列。辺の上に背の高い木は置かない)・石垣・土の農道・細い小川。森の縁は林冠そのものが縁なので、
-// 林の外に農道を沿わせる。頂点のすぐそば(建物・置ける場所の印)はVERTEX_CLEARぶん空ける。
-function buildHexBoundaries(g, V) {
+// 林の外に農道を沿わせる。頂点のすぐそば(建物・置ける場所の印)はVERTEX_CLEARぶん空ける(都市ならCITY_CLEAR)。
+// 'path'(農道)は、実際に道(持ち主の石畳)が敷かれている辺では描かない(buildRoadの路面と二重になるため)。
+function buildHexBoundaries(g, V, cityVerts) {
   g.edges.forEach((edge) => {
     const hexes = (edge.hexIds || []).map((id) => g.hexes[id]).filter(Boolean);
     if (hexes.length < 2) return; // 盤の外周(海)は描かない
     if (hexes.some((h) => WATER_LIKE.has(h.terrain) || h.fog)) return; // 本物の海岸線(渚)は描かない
     const style = boundaryStyle(hexes[0].terrain, hexes[1].terrain, edge.id);
     if (!style) return;
+    if (style === 'path' && edge.road != null) return; // 実際の道(石畳)がそこの路面を描くので譲る
     const v1 = g.vertices[edge.v1], v2 = g.vertices[edge.v2];
     const x1 = v1.x * SCALE, z1 = v1.y * SCALE, x2 = v2.x * SCALE, z2 = v2.y * SCALE;
     const full = Math.hypot(x2 - x1, z2 - z1);
     const ux = (x2 - x1) / full, uz = (z2 - z1) / full;
-    const m = VERTEX_CLEAR - 2;
-    const ax = x1 + ux * m, az = z1 + uz * m, bx = x2 - ux * m, bz = z2 - uz * m;
+    const m1 = cityVerts.has(v1.id) ? CITY_CLEAR : VERTEX_CLEAR - 2;
+    const m2 = cityVerts.has(v2.id) ? CITY_CLEAR : VERTEX_CLEAR - 2;
+    const ax = x1 + ux * m1, az = z1 + uz * m1, bx = x2 - ux * m2, bz = z2 - uz * m2;
     const ang = Math.atan2(uz, ux);
     const fy = baseYOfHex(hexes[0]);
     const rr = hexRng(edge.id * 613 + 1);
@@ -1764,60 +1927,174 @@ function addPitch(cx, cz, height) {
   });
 }
 
+// 航海者の船(拡張)。舳先がとがったGEO.shipHull+マスト+帆(持ち主の色、布の彩度)
 function addShip(mx, mz, ang, playerColor) {
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(18, 5, 7), new THREE.MeshStandardMaterial({ color: 0x4a3420 }));
-  hull.position.set(mx, SEA_LEVEL + 2.5, mz);
+  const hull = new THREE.Mesh(GEO.shipHull, MAT.boatHull);
+  hull.position.set(mx, SEA_LEVEL + 2.2, mz);
   hull.rotation.y = ang;
-  const sail = new THREE.Mesh(new THREE.ConeGeometry(6, 12, 3), new THREE.MeshStandardMaterial({ color: new THREE.Color(playerColor) }));
+  const mast = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.26, 7, 6), MAT.signPost);
+  mast.position.set(mx, SEA_LEVEL + 5.7, mz);
+  const sail = new THREE.Mesh(GEO.boatSail, clothMaterial(playerColor));
+  sail.scale.set(2.5, 2.8, 2.5);
   sail.rotation.y = ang;
-  sail.rotation.z = Math.PI / 2;
-  sail.position.set(mx, SEA_LEVEL + 9, mz);
-  hull.castShadow = true; sail.castShadow = true;
-  sceneGroup.add(hull, sail);
+  sail.position.set(mx, SEA_LEVEL + 9.5, mz);
+  [hull, mast, sail].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
 }
 
-// 家: 土台(石)・壁・軒(屋根の張り出し)・屋根の4段。軒は壁より少し広い板を45度回し、角を庇のように張り出す
-function addHouse(x, baseY, z, color) {
-  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), roughness: 0.95 });
-  const wallMat = new THREE.MeshStandardMaterial({ color, roughness: 0.8 });
-  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), roughness: 0.75 });
-  const plinth = new THREE.Mesh(new THREE.BoxGeometry(12.5, 2, 12.5), stoneMat);
-  plinth.position.set(x, baseY + 1 + 1.5, z);
-  const body = new THREE.Mesh(new THREE.BoxGeometry(11, 8, 11), wallMat);
-  body.position.set(x, baseY + 2 + 4 + 1.5, z);
-  const eave = new THREE.Mesh(new THREE.BoxGeometry(13, 1.2, 13), roofMat);
-  eave.rotation.y = Math.PI / 4;
-  eave.position.set(x, baseY + 2 + 8 + 0.6 + 1.5, z);
-  const roof = new THREE.Mesh(new THREE.ConeGeometry(9, 7, 4), roofMat);
-  roof.rotation.y = Math.PI / 4;
-  roof.position.set(x, baseY + 2 + 8 + 1.2 + 3.5 + 1.5, z);
-  [plinth, body, eave, roof].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
+// 頂点から出ている道を避けた方角に、家を数棟リング状に置く(開拓地=農家の集落)。
+// 壁・土台・軒・屋根は持ち主色なし(石灰・石積み・瓦/茅葺き)。持ち主の色は雨戸・日よけ布・旗だけに出す。
+// ④の直し: 頂点の空き(VERTEX_CLEAR)いっぱいに広がる集落のかたまりに見えるよう、家の数と半径を増やした。
+function buildSettlement(B, g, v, x, z, baseY, cloth) {
+  const used = vertexEdgeAngles(g, v);
+  const rr = hexRng(v.id * 7919 + 101);
+  const slots = 9;
+  const free = [];
+  for (let i = 0; i < slots; i++) {
+    const a = (i / slots) * Math.PI * 2 + rr(-0.1, 0.1);
+    if (used.some((u) => angDiff(a, u) < 0.5)) continue;
+    free.push(a);
+  }
+  for (let i = free.length - 1; i > 0; i--) { const j = Math.floor(rr(0, i + 1)); [free[i], free[j]] = [free[j], free[i]]; } // 決定的シャッフル
+  const n = Math.min(Math.round(rr(5, 8.999)), Math.max(free.length, 1));
+  let smoked = false, flagY = -Infinity; // ④の直し: 旗は頂点そのものの高さ(海岸のすぐきわだと渚の低さを拾うことがある)ではなく、
+  // まわりの家の高さの最大値に合わせる(どの家よりも低く沈んで見えなくなるのを防ぐ)
+  for (let i = 0; i < n; i++) {
+    const a = free.length ? free[i % free.length] : rr(0, Math.PI * 2);
+    const r = rr(6.0, 11.0);
+    const hx = x + Math.cos(a) * r, hz = z + Math.sin(a) * r;
+    const hy = groundY(hx, hz, baseY);
+    flagY = Math.max(flagY, hy);
+    const ry = a + Math.PI + rr(-0.25, 0.25); // 中心のほうを向かせる
+    const s = rr(1.0, 1.4);
+    const thatch = rr(0, 1) < 0.45;
+    pushHouse(B, hx, hy, hz, ry, s, thatch, v.id * 13 + i, cloth);
+    if (!smoked) { B.chimney.push({ x: hx, y: hy, z: hz, ry, s }); addSmokePuffs(hx, hz, hy + 5.1 * s, 3, v.id * 97 + 1); smoked = true; }
+  }
+  // ponytail: 渚ぎりぎりの頂点だと地形が海面付近まで下がることがあるので、旗だけは最低でも海面より少し上に留める
+  const fy = Math.max(groundY(x, z, baseY), flagY, SEA_LEVEL + 1.5), fa = rr(0, Math.PI * 2);
+  B.flagPole.push({ x, y: fy, z, ry: fa, s: 1.3 });
+  B.flagCloth.push({ x, y: fy, z, ry: fa, s: 1.3, color: cloth });
 }
-// 都市: 土台・基部・塔・塔の軒・屋根。基部と塔はどちらも面取り代わりに軒(張り出し)を挟む
-function addCity(x, baseY, z, color) {
-  const stoneMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.55), roughness: 0.95 });
-  const wallMat = new THREE.MeshStandardMaterial({ color, roughness: 0.8 });
-  const roofMat = new THREE.MeshStandardMaterial({ color: color.clone().multiplyScalar(0.72), roughness: 0.75 });
-  const plinth = new THREE.Mesh(new THREE.BoxGeometry(18.5, 2, 18.5), stoneMat);
-  plinth.position.set(x, baseY + 1 + 1.5, z);
-  const base = new THREE.Mesh(new THREE.BoxGeometry(17, 9, 17), wallMat);
-  base.position.set(x, baseY + 2 + 4.5 + 1.5, z);
-  const tower = new THREE.Mesh(new THREE.CylinderGeometry(6, 6.6, 17, 8), wallMat);
-  tower.position.set(x, baseY + 2 + 9 + 8.5 + 1.5, z);
-  const towerEave = new THREE.Mesh(new THREE.CylinderGeometry(8, 8, 1.4, 8), roofMat);
-  towerEave.position.set(x, baseY + 2 + 9 + 17 + 0.7 + 1.5, z);
-  const roof = new THREE.Mesh(new THREE.ConeGeometry(7, 9, 8), roofMat);
-  roof.position.set(x, baseY + 2 + 9 + 17 + 1.4 + 4.5 + 1.5, z);
-  [plinth, base, tower, towerEave, roof].forEach((m) => { m.castShadow = true; sceneGroup.add(m); });
+function pushHouse(B, hx, hy, hz, ry, s, thatch, seed, cloth) {
+  B.plinth.push({ x: hx, y: hy, z: hz, ry, s });
+  B.wall.push({ x: hx, y: hy, z: hz, ry, s, seed }); // 持ち主色なし(石灰・石積み)。seedはvarianceの色むらに使う
+  B.shutter.push({ x: hx, y: hy, z: hz, ry, s, color: cloth });
+  B.awning.push({ x: hx, y: hy, z: hz, ry, s, color: cloth });
+  B.eave.push({ x: hx, y: hy, z: hz, ry, s });
+  (thatch ? B.roofThatch : B.roofTile).push({ x: hx, y: hy, z: hz, ry, s, seed });
 }
+function addSmokePuffs(x, z, y, count, seed) {
+  const rr = hexRng(seed);
+  for (let i = 0; i < count; i++) {
+    const puff = new THREE.Mesh(GEO.smoke, MAT.smoke.clone());
+    puff.material.opacity = 0.3 - i * 0.06;
+    puff.scale.setScalar(0.6 + i * 0.5);
+    puff.position.set(x + i * 0.9 + rr(-0.25, 0.25), y + i * 0.85, z - i * 0.5 + rr(-0.25, 0.25));
+    sceneGroup.add(puff);
+  }
+}
+const CHURCH_TIP = 24.7; // churchSpireRoofの先端の高さ(ground基準。都市の旗の根元に使う)
+// 都市: 石の城壁(円)+控え塔2本+凹凸+教会(身廊・屋根・尖塔)+中に密集した小さい家。開拓地よりはっきり大きい。
+function buildCity(B, g, v, x, z, baseY, cloth) {
+  const rr = hexRng(v.id * 6151 + 211);
+  const y = groundY(x, z, baseY);
+  const wallRot = rr(0, Math.PI * 2); // ponytail: 門は見た目の切れ目を作らず、塔の向きだけで示す(通行判定はもとから無い)
+  const stone = getCityStoneMaterial(); // ④の直し: のっぺり灰色の円筒をやめ、山の岩肌テクスチャで石積みの質感・色むらを出す
+  const wall = new THREE.Mesh(GEO.cityWallRing, stone);
+  wall.position.set(x, y + 4.75, z); wall.rotation.y = wallRot;
+  wall.castShadow = true; wall.receiveShadow = true;
+  sceneGroup.add(wall);
+  [-0.55, 0.55].forEach((side) => { // 門の両脇の塔(屋根と、持ち主の色の小旗。窓は明暗を付けて石積みらしく)
+    const a = wallRot + side;
+    const tx = x + Math.cos(a) * 16.2, tz = z + Math.sin(a) * 16.2;
+    const tower = new THREE.Mesh(GEO.cityTower, stone);
+    tower.position.set(tx, y + 8, tz);
+    const roof = new THREE.Mesh(GEO.cityTowerRoof, MAT.roofTile);
+    roof.position.set(tx, y + 16 + 3.2, tz);
+    tower.castShadow = roof.castShadow = true;
+    sceneGroup.add(tower, roof);
+    [0, Math.PI / 2, Math.PI, Math.PI * 1.5].forEach((wa) => { // 窓(2段x4方向)
+      [5.2, 11.2].forEach((wy) => {
+        B.towerWindow.push({ x: tx + Math.cos(wa) * 3.95, y: y + wy, z: tz + Math.sin(wa) * 3.95, ry: -wa });
+      });
+    });
+    const fa = a + Math.PI; // 塔の旗は外向きに
+    B.flagPole.push({ x: tx, y: y + 16 + 6.4, z: tz, ry: fa, s: 0.75 });
+    B.flagCloth.push({ x: tx, y: y + 16 + 6.4, z: tz, ry: fa, s: 0.75, color: cloth });
+  });
+  for (let i = 0; i < 20; i++) { // 城壁の上の凹凸(まとめてバッチ)
+    const a = (i / 20) * Math.PI * 2;
+    B.crenel.push({ x: x + Math.cos(a) * 16.2, y: y + 9.6, z: z + Math.sin(a) * 16.2, ry: a, seed: v.id * 31 + i });
+  }
+  const body = new THREE.Mesh(GEO.churchBody, MAT.housePlinth);
+  const roof = new THREE.Mesh(GEO.churchRoof, MAT.roofTile);
+  const spire = new THREE.Mesh(GEO.churchSpire, stone);
+  const spireRoof = new THREE.Mesh(GEO.churchSpireRoof, MAT.roofTile);
+  [body, roof, spire, spireRoof].forEach((m) => { m.position.set(x, y, z); m.rotation.y = wallRot; m.castShadow = true; sceneGroup.add(m); });
+  const usedA = vertexEdgeAngles(g, v);
+  for (let i = 0; i < 10; i++) { // 城壁の中に密集した小さい家(開拓地より小さく、多い)
+    const a = (i / 10) * Math.PI * 2 + rr(-0.1, 0.1);
+    if (usedA.some((u) => angDiff(a, u) < 0.45)) continue;
+    if (angDiff(a, wallRot - 0.55) < 0.5 || angDiff(a, wallRot + 0.55) < 0.5) continue; // 塔のそば
+    const r = rr(9.5, 13.3);
+    const hx = x + Math.cos(a) * r, hz = z + Math.sin(a) * r;
+    pushHouse(B, hx, groundY(hx, hz, baseY), hz, a + Math.PI + rr(-0.2, 0.2), rr(0.55, 0.8), rr(0, 1) < 0.3, v.id * 17 + i, cloth);
+  }
+  const fa = rr(0, Math.PI * 2); // 旗は教会の尖塔の先に、塔の旗より大きく(開拓地よりはっきり目立つ)
+  B.flagPole.push({ x, y: y + CHURCH_TIP, z, ry: fa, s: 1.05 });
+  B.flagCloth.push({ x, y: y + CHURCH_TIP, z, ry: fa, s: 1.05, color: cloth });
+}
+// 小さな兵の一団(三角の隊形)+持ち主の旗。「都市と騎士」の騎士・蛮族の騎士の両方で使う
+// ④の直し: 外套は旗・標柱と同じ「染めた布」の色調(clothColor)にそろえ、既定のカメラでも持ち主がわかるよう一回り大きくした。
 function addKnight(x, baseY, z, color, active) {
-  const c = new THREE.Color(color);
-  if (!active) c.multiplyScalar(0.55);
-  const body = new THREE.Mesh(new THREE.CylinderGeometry(3.2, 4.2, 10, 7), new THREE.MeshStandardMaterial({ color: c }));
-  body.position.set(x, baseY + 5 + 1.5, z);
-  const head = new THREE.Mesh(new THREE.SphereGeometry(3, 8, 6), new THREE.MeshStandardMaterial({ color: c }));
-  head.position.set(x, baseY + 11 + 1.5, z);
-  sceneGroup.add(body, head);
+  const y = groundY(x, z, baseY);
+  const headMat = active ? MAT.knightArmor : new THREE.MeshStandardMaterial({ color: 0x3a3d44, roughness: 0.6, metalness: 0.3 });
+  const robeColor = clothColor(color);
+  if (!active) robeColor.multiplyScalar(0.75); // 非アクティブは少し沈ませるだけ(色味は残す)
+  const robeMat = new THREE.MeshStandardMaterial({ color: robeColor, roughness: 0.78 });
+  // 外套(持ち主の色。上面が平らな筒で、見下ろすカメラでも色がはっきり見える)+頭(灰色)
+  [[0, 0], [-1.9, 1.1], [1.9, 1.1]].forEach(([dx, dz]) => {
+    const robe = new THREE.Mesh(GEO.knightRobe, robeMat);
+    robe.position.set(x + dx, y + 1.3, z + dz);
+    robe.scale.setScalar(1.35);
+    const head = new THREE.Mesh(GEO.knightHead, headMat);
+    head.position.set(x + dx, y + 3.0, z + dz);
+    head.scale.setScalar(1.3);
+    robe.castShadow = head.castShadow = true;
+    sceneGroup.add(robe, head);
+  });
+  const pole = new THREE.Mesh(GEO.flagPole, MAT.signPost);
+  pole.scale.setScalar(0.42); pole.position.set(x, y, z);
+  const flag = new THREE.Mesh(GEO.flagCloth, clothMaterial(color));
+  flag.scale.setScalar(0.42); flag.position.set(x, y, z);
+  pole.castShadow = flag.castShadow = true;
+  sceneGroup.add(pole, flag);
+}
+// 道(石畳/土の路面+轍+ところどころの標柱の布)。実際の路面はB(instancedFromでまとめてバッチ)に積む
+// ④の直し: 道幅を広げたぶん轍・生け垣・標柱も外側へ出し、標柱の布は1本の道に3〜4本に絞って大きくした。
+function buildRoad(B, x1, z1, x2, z2, baseY, cloth, edgeSeed, ang) {
+  const full = Math.hypot(x2 - x1, z2 - z1);
+  const ux = (x2 - x1) / full, uz = (z2 - z1) / full, px = -uz, pz = ux;
+  const trim = 2; // 頂点の建物のすぐきわまで敷く
+  const ax = x1 + ux * trim, az = z1 + uz * trim, bx = x2 - ux * trim, bz = z2 - uz * trim;
+  const rr = hexRng(edgeSeed * 911 + 5);
+  const pts = alongSeg(ax, az, bx, bz, 2.0);
+  const bannerEvery = Math.max(6, Math.round(pts.length / 4)); // 道1本に3〜4本になるよう間隔を決める
+  pts.forEach(([x, z], i) => {
+    const y = groundY(x, z, baseY);
+    B.roadTile.push({ x, y: y + 0.08, z, ry: ang, seed: edgeSeed * 37 + i });
+    [-1, 1].forEach((side) => B.roadRut.push({ x: x + px * 4.0 * side, y: y + 0.12, z: z + pz * 4.0 * side, ry: ang }));
+    if (rr(0, 1) < 0.3) {
+      const side = rr(0, 1) < 0.5 ? 1 : -1;
+      B.roadsideBush.push({ x: x + px * 6.8 * side, y: y + 0.4, z: z + pz * 6.8 * side, s: rr(0.6, 1.0), ry: rr(0, 6), seed: edgeSeed * 53 + i });
+    }
+    if (i % bannerEvery === 0) { // 標柱(持ち主の色の布)
+      const sx = x + px * 7.2, sz = z + pz * 7.2;
+      const sy = groundY(sx, sz, baseY);
+      B.signPost.push({ x: sx, y: sy, z: sz, ry: ang });
+      B.banner.push({ x: sx, y: sy, z: sz, ry: ang + Math.PI / 2, color: cloth });
+    }
+  });
 }
 // 盗賊: マント(裾広がりの円錐)・肩の襟巻き(トーラス)・頭・とがり帽子のつば
 function addRobber(cx, height, cz, blink) {
@@ -1835,8 +2112,10 @@ function addRobber(cx, height, cz, blink) {
   if (blink) addPulseRing(cx, height + 1, cz, 20, 0xffd84a);
 }
 function addPirate(cx, height, cz, blink) {
-  const hull = new THREE.Mesh(new THREE.BoxGeometry(22, 6, 14), new THREE.MeshStandardMaterial({ color: 0x2b1d10 }));
+  const hull = new THREE.Mesh(GEO.shipHull, new THREE.MeshStandardMaterial({ color: 0x2b1d10, roughness: 0.85 }));
+  hull.scale.set(22 / 16, 6 / 4.6, 14 / 6.4); // 航海者の船と同じ形(舳先がとがった船体)を蛮族の船の大きさに拡大
   hull.position.set(cx, height + 3, cz);
+  hull.castShadow = true;
   sceneGroup.add(hull);
   addRobber(cx, height + 4, cz, blink);
 }
