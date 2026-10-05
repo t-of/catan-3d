@@ -1,0 +1,18 @@
+{
+  "id": "./",
+  "name": "catan-3d — 立体の盤で遊ぶ陣取りボード",
+  "short_name": "catan-3d",
+  "description": "六角タイルの盤を three.js の立体で描いた、資源を集めて道・開拓地・都市を建てる交代プレイの試作。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#0f1320",
+  "theme_color": "#0f1320",
+  "lang": "ja",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
+    { "src": "icons/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }
+  ]
+}

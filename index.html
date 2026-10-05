@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0d1720">
+  <meta name="description" content="六角タイルの盤を three.js の立体で描いた、資源を集めて道・開拓地・都市を建てる交代プレイの試作。">
+  <title>catan-3d — 立体の盤で遊ぶ陣取りボード</title>
+
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="catan-3d">
+  <meta property="og:title" content="catan-3d — 立体の盤で遊ぶ陣取りボード">
+  <meta property="og:description" content="六角タイルの盤を three.js の立体で描いた、資源を集めて道・開拓地・都市を建てる交代プレイの試作。">
+  <meta property="og:url" content="https://t-of.github.io/catan-3d/">
+  <meta property="og:image" content="https://t-of.github.io/catan-3d/icons/og.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:locale" content="ja_JP">
+  <meta name="twitter:card" content="summary_large_image">
+
+  <!-- apple-mobile-web-app-status-bar-style は付けない（black-translucent だと iOS 26 で上部が隠れる） -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="catan-3d">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="icon" href="./icons/icon.svg" type="image/svg+xml">
+  <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png">
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png">
+
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="./webapp-kit/webapp-kit.css">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <main class="app">
+    <div class="host-gone" id="hostGoneBar" hidden>
+      <span>ホストが切れました。</span>
+      <button class="btn btn--small btn--accent" id="hostGoneBtn">代わりに進める</button>
+    </div>
+    <header class="bar">
+      <h1 class="bar__title">catan-3d</h1>
+      <div class="bar__actions">
+        <button class="btn btn--small" id="homeBtn" hidden>タイトルへ</button>
+        <button class="btn btn--small" data-wak="install" hidden>アプリにする</button>
+        <button class="btn btn--small" id="motionBtn" aria-pressed="true">動き オン</button>
+        <button class="btn btn--small" id="soundBtn" aria-pressed="true">音 オン</button>
+        <button class="btn btn--small" id="bgmBtn" aria-pressed="true">BGM オン</button>
+        <button class="btn btn--small" id="cpuSpeedBtn">CPU ふつう</button>
+        <button class="btn btn--small" data-wak="share">共有</button>
+      </div>
+    </header>
+
+    <!-- 人数選び -->
+    <section class="setup" id="setupPanel">
+      <div class="setup__sea"></div>
+      <div class="setup__board"><svg id="titleBoard" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet"></svg></div>
+      <div class="setup__logo">catan-3d</div>
+      <p class="setup__lead">開拓と交易のボードゲーム。1台で交代して遊ぶ試作です。</p>
+      <div class="panel setup__panel" id="mainSetupView">
+        <div class="setup__row">
+          <span>人数</span>
+          <div class="segmented" id="playerCountPicker">
+            <button class="btn" data-count="3">3人</button>
+            <button class="btn" data-count="4">4人</button>
+            <button class="btn" data-count="5">5人</button>
+            <button class="btn" data-count="6">6人</button>
+          </div>
+        </div>
+        <div class="setup__row" id="expansionRow">
+          <span>拡張</span>
+          <div class="segmented" id="expansionPicker">
+            <button class="btn" data-expansion="none">なし</button>
+            <button class="btn" data-expansion="seafarers">航海者版</button>
+            <button class="btn" data-expansion="cities-knights">都市と騎士</button>
+            <button class="btn" data-expansion="traders-barbarians" data-min-players="3" data-max-players="6">交易と略奪</button>
+            <button class="btn" data-expansion="soccer" data-min-players="3" data-max-players="4">サッカー熱</button>
+            <button class="btn" data-expansion="explorers-pirates" data-min-players="3" data-max-players="6">探検家と海賊</button>
+          </div>
+        </div>
+        <div class="setup__row" id="scenarioRow" hidden>
+          <span>シナリオ</span>
+          <div class="segmented" id="scenarioPicker">
+            <button class="btn" data-scenario="fishermen">漁師</button>
+            <button class="btn" data-scenario="rivers">川</button>
+            <button class="btn" data-scenario="caravans">隊商</button>
+            <button class="btn" data-scenario="barbarians">蛮族の襲撃</button>
+          </div>
+        </div>
+        <p class="setup__note" id="expansionNote" hidden>5〜6人は自動で5〜6人拡張の盤になります。サッカー熱・探検家と海賊は3〜4人だけです。</p>
+        <div class="seats" id="seatsPanel"></div>
+        <button class="btn btn--accent btn--big" id="startBtn">はじめる</button>
+        <button class="btn" id="continueBtn" hidden>つづきから</button>
+        <button class="btn" id="onlineBtn">みんなのスマホで</button>
+        <button class="btn" id="onlineResumeBtn" hidden>部屋に戻る</button>
+      </div>
+
+      <!-- 通信対戦: 名前 -->
+      <div class="panel setup__panel" id="onlineNameView" hidden>
+        <h2>名前</h2>
+        <input class="seat-row__name" id="onlineNameInput" maxlength="10" inputmode="text" placeholder="名無し" style="max-width:none">
+        <p class="setup__note">本名でなくてよいです。10字まで。</p>
+        <button class="btn btn--accent btn--big" id="onlineNameNextBtn">次へ</button>
+        <button class="btn" id="onlineNameBackBtn">もどる</button>
+      </div>
+
+      <!-- 通信対戦: 部屋を作る / 入る -->
+      <div class="panel setup__panel" id="onlineChoiceView" hidden>
+        <h2>みんなのスマホで</h2>
+        <button class="btn btn--accent btn--big" id="onlineCreateBtn">部屋を作る</button>
+        <div class="setup__row">
+          <input class="seat-row__name" id="onlineJoinCode" maxlength="4" inputmode="text" placeholder="コード" style="max-width:none;text-transform:uppercase">
+          <button class="btn" id="onlineJoinBtn">入る</button>
+        </div>
+        <p class="setup__note" id="onlineChoiceError"></p>
+        <button class="btn" id="onlineChoiceBackBtn">もどる</button>
+      </div>
+
+      <!-- 通信対戦: 待合 -->
+      <div class="panel setup__panel" id="onlineLobbyView" hidden>
+        <h2>待合</h2>
+        <div class="room-code" id="lobbyCode"></div>
+        <button class="btn" id="lobbyInviteBtn">招待する</button>
+        <details class="qr-details">
+          <summary class="btn">QRコードで招待する</summary>
+          <div class="qr-code" id="lobbyQr"></div>
+        </details>
+        <div class="setup__row" id="lobbyCountRow">
+          <span>人数</span>
+          <div class="segmented" id="lobbyCountPicker">
+            <button class="btn" data-count="3">3人</button>
+            <button class="btn" data-count="4">4人</button>
+            <button class="btn" data-count="5">5人</button>
+            <button class="btn" data-count="6">6人</button>
+          </div>
+        </div>
+        <div class="setup__row" id="lobbyExpansionRow">
+          <span>拡張</span>
+          <div class="segmented" id="lobbyExpansionPicker"></div>
+        </div>
+        <div class="setup__row" id="lobbyScenarioRow" hidden>
+          <span>シナリオ</span>
+          <div class="segmented" id="lobbyScenarioPicker">
+            <button class="btn" data-scenario="fishermen">漁師</button>
+            <button class="btn" data-scenario="rivers">川</button>
+            <button class="btn" data-scenario="caravans">隊商</button>
+            <button class="btn" data-scenario="barbarians">蛮族の襲撃</button>
+          </div>
+        </div>
+        <div class="seats" id="lobbySeats"></div>
+        <button class="btn btn--accent btn--big" id="lobbyStartBtn">はじめる</button>
+        <p class="setup__note" id="lobbyWaitText">ホストがはじめるのを待っています。</p>
+        <button class="btn" id="lobbyLeaveBtn">部屋を出る</button>
+      </div>
+    </section>
+
+    <!-- ゲーム画面 -->
+    <section class="game" id="gamePanel" hidden>
+      <div class="cutin-layer" id="cutinLayer" aria-live="polite"></div>
+      <aside class="side side--left">
+        <div class="side-head">
+          <div class="side-head__brand"><span class="side-head__logo">catan-3d</span><span class="side-head__tag">開拓と交易</span></div>
+          <div class="side-head__turn">ターン <b id="turnNum">1</b></div>
+        </div>
+        <div class="players" id="playersBar"></div>
+        <div class="panel bank" id="bankPanel"></div>
+      </aside>
+
+      <div class="board-area">
+        <div class="stage" id="stage">
+          <!-- 3D の盤(board3d.js)。判定は board の SVG と同じデータを使う(見た目には出さない) -->
+          <div id="board3d"></div>
+          <svg id="board" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet"></svg>
+          <div class="hint" id="hint"></div>
+          <div class="dice" id="diceBox"></div>
+        </div>
+        <div class="panel message" id="banner"></div>
+      </div>
+
+      <aside class="side side--right">
+        <div class="panel hand-panel">
+          <div class="panel__head"><span>手札</span><span id="handCount"></span></div>
+          <div class="hand" id="handBar"></div>
+        </div>
+        <div class="panel ck-panel" id="ckPanel" hidden></div>
+        <div class="panel ck-panel" id="soccerPanel" hidden></div>
+        <div class="panel builds-panel">
+          <div class="panel__head">建てる</div>
+          <div class="builds" id="buildGrid"></div>
+        </div>
+        <div class="actions" id="actionBar">
+          <button class="btn" id="diceBtn">サイコロ</button>
+          <button class="btn" id="tradeBtn">交易</button>
+          <button class="btn" id="devBtn">発展カード</button>
+          <button class="btn btn--accent btn--wide" id="endTurnBtn">手番を終える</button>
+        </div>
+      </aside>
+
+      <div class="overlay" id="panelOverlay" hidden>
+        <div class="panel sheet" id="panel"></div>
+      </div>
+    </section>
+
+    <footer class="credit">
+      <a href="/">T.OF...</a> のアプリ・<a href="https://t-of.github.io/contact/">問い合わせ</a>
+    </footer>
+  </main>
+
+  <script src="./webapp-kit/webapp-kit.js"></script>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
