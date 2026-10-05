@@ -11,8 +11,10 @@
 // 毎回丸ごと作り直しても重くならない。木や羊などの繰り返しはInstancedMeshでまとめ、台数を抑える。
 import * as THREE from './vendor/three.module.min.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
+import { RoomEnvironment } from './vendor/RoomEnvironment.js';
 
 const SCALE = 66; // main.jsのSCALEと同じ値（頂点のx,yをこの倍率でワールド座標にする）
+const REDUCE_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
 
 // ---- 地形ごとの色・高さ（illust.jsのTERRAIN_STYLEと同じ地形名） ----
 const TERRAIN_COLOR = {
@@ -25,8 +27,12 @@ const TERRAIN_HEIGHT = {
   water: 3, gold: 13, lake: 3, castle: 20, pitch: 8, fog: 12,
 };
 const RES_COLOR3D = { wood: 0x3f8a4a, brick: 0xc0643a, sheep: 0x8cc063, wheat: 0xe0b440, ore: 0x8a92a3 };
+const TERRAIN_ROUGH = {
+  forest: 0.95, pasture: 0.85, field: 0.7, hills: 0.9, mountains: 0.95, desert: 0.9,
+  water: 0.2, gold: 0.5, lake: 0.2, castle: 0.8, pitch: 0.65, fog: 0.9,
+};
 
-let scene, camera, renderer, controls, raycaster, pointer, clock;
+let scene, camera, renderer, controls, raycaster, pointer, clock, sun;
 let sceneGroup; // 毎回まるごと作り直す盤の中身
 let onTapCb = null;
 let hitTargets = []; // [{ mesh, kind, id }]（レイキャストで拾う的）
@@ -59,30 +65,43 @@ const MAT = {
   cactus: new THREE.MeshStandardMaterial({ color: 0x4f8a43, flatShading: true, roughness: 0.9 }),
   gold: new THREE.MeshStandardMaterial({ color: 0xf0c83c, flatShading: true, roughness: 0.4, metalness: 0.6, emissive: 0x4a3a00 }),
 };
+const TERRAIN_MAT = {}; // 地形ごとのタイル材質（テクスチャ付き）。terrainTexture()と一緒に使い回す
+
+function clampUnit(v) { return Math.min(1, Math.max(0, v)); }
 
 export function initBoard3D(container, onTap) {
   onTapCb = onTap;
   scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0c2b3a);
-  scene.fog = new THREE.Fog(0x0c2b3a, 900, 2200);
+  scene.background = skyTexture();
+  scene.fog = new THREE.Fog(0xbfe3f2, 900, 2200);
 
   camera = new THREE.PerspectiveCamera(42, 1, 1, 4000);
   renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  // 細い指での操作が多い環境(タッチ)は解像度を少し落として重さを抑える
+  const dprCap = (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) ? 1.5 : 2;
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, dprCap));
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.toneMappingExposure = 1.05;
   container.appendChild(renderer.domElement);
 
-  scene.add(new THREE.HemisphereLight(0xdcefff, 0x1a2a1a, 0.95));
-  const sun = new THREE.DirectionalLight(0xfff2d6, 1.25);
+  // 環境光(映り込み)をRoomEnvironmentから1回だけ作って使い回す
+  const pmrem = new THREE.PMREMGenerator(renderer);
+  scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+  pmrem.dispose();
+
+  scene.add(new THREE.HemisphereLight(0xdcefff, 0x1a2a1a, 0.6));
+  sun = new THREE.DirectionalLight(0xfff2d6, 1.4);
   sun.position.set(260, 480, 180);
   sun.castShadow = true;
   sun.shadow.mapSize.set(1024, 1024);
   sun.shadow.camera.near = 10; sun.shadow.camera.far = 1600;
-  const d = 500;
-  sun.shadow.camera.left = -d; sun.shadow.camera.right = d; sun.shadow.camera.top = d; sun.shadow.camera.bottom = -d;
   scene.add(sun);
+
+  // 木・羊・麦・岩などに使う材質は、個体ごとに色をわずかにずらす(InstancedMeshの頂点カラー)
+  [MAT.leaf, MAT.sheep, MAT.wheat, MAT.mound, MAT.peak, MAT.cactus].forEach((m) => { m.vertexColors = true; });
 
   controls = new OrbitControls(camera, renderer.domElement);
   controls.enablePan = false;
@@ -138,9 +157,24 @@ function pick(dom, cx, cy) {
   if (found && onTapCb) onTapCb(found.kind, found.id);
 }
 
+// 空のグラデーション(濃い青→水平線の淡い水色)。1回だけ作って使い回す
+function skyTexture() {
+  const c = document.createElement('canvas');
+  c.width = 2; c.height = 256;
+  const ctx = c.getContext('2d');
+  const grad = ctx.createLinearGradient(0, 0, 0, 256);
+  grad.addColorStop(0, '#2d6ca0');
+  grad.addColorStop(1, '#bfe3f2');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 2, 256);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 function animate() {
   const t = clock.getElapsedTime();
-  waterMeshes.forEach((m, i) => {
+  if (!REDUCE_MOTION) waterMeshes.forEach((m, i) => {
     m.position.y = m.userData.baseY + Math.sin(t * 1.6 + i * 1.7) * 1.6;
     m.rotation.z = Math.sin(t * 0.8 + i) * 0.015;
   });
@@ -161,38 +195,128 @@ function hexCenterOf(g, hex) {
 function hexPointsOf(g, hex) {
   return hex.vertexIds.map((id) => { const v = g.vertices[id]; return [v.x * SCALE, v.y * SCALE]; });
 }
-// 六角柱（上面・側面だけ。底面は海に隠れて見えないので省く）
+// 六角柱（上面・側面だけ。底面は海に隠れて見えないので省く）。
+// 上の縁を少し面取りして、平らな板ではなく厚みのあるタイルに見せる。
 function hexPrismGeometry(pts, height) {
   const cx = pts.reduce((a, p) => a + p[0], 0) / pts.length;
   const cz = pts.reduce((a, p) => a + p[1], 0) / pts.length;
-  const pos = [];
+  const bevel = Math.min(5, height * 0.25);
+  const inner = pts.map((p) => [cx + (p[0] - cx) * 0.86, cz + (p[1] - cz) * 0.86]);
+  const outerY = height - bevel;
+  const pos = [], uv = [];
   const n = pts.length;
+  const uvOf = (x, z) => [(x - cx) / (SCALE * 1.3) * 0.5 + 0.5, (z - cz) / (SCALE * 1.3) * 0.5 + 0.5];
+  const push3 = (p0, p1, p2) => {
+    pos.push(p0[0], p0[1], p0[2], p1[0], p1[1], p1[2], p2[0], p2[1], p2[2]);
+    uv.push(...uvOf(p0[0], p0[2]), ...uvOf(p1[0], p1[2]), ...uvOf(p2[0], p2[2]));
+  };
   for (let i = 0; i < n; i++) {
     const a = pts[i], b = pts[(i + 1) % n];
-    pos.push(cx, height, cz, b[0], height, b[1], a[0], height, a[1]); // 上面
-    pos.push(a[0], 0, a[1], b[0], 0, b[1], b[0], height, b[1]); // 側面 x2
-    pos.push(a[0], 0, a[1], b[0], height, b[1], a[0], height, a[1]);
+    const ia = inner[i], ib = inner[(i + 1) % n];
+    // 内側の平らな天面
+    push3([cx, height, cz], [ib[0], height, ib[1]], [ia[0], height, ia[1]]);
+    // 面取りの斜面（内側の縁→外側の縁）
+    push3([ia[0], height, ia[1]], [ib[0], height, ib[1]], [b[0], outerY, b[1]]);
+    push3([ia[0], height, ia[1]], [b[0], outerY, b[1]], [a[0], outerY, a[1]]);
+    // 側面（外側の縁→地面）
+    push3([a[0], outerY, a[1]], [b[0], outerY, b[1]], [b[0], 0, b[1]]);
+    push3([a[0], outerY, a[1]], [b[0], 0, b[1]], [a[0], 0, a[1]]);
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
   geo.computeVertexNormals();
   return geo;
 }
-function instancedFrom(geo, mat, items) {
+// variance: 0より大きいと、個体ごとに色相をわずかにずらす(同じ木・岩が並ぶ単調さを消す)
+function instancedFrom(geo, mat, items, variance) {
   if (!items.length) return null;
   const mesh = new THREE.InstancedMesh(geo, mat, items.length);
   const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler();
+  const hsl = variance ? mat.color.getHSL({}) : null;
   items.forEach((it, i) => {
     e.set(it.rx || 0, it.ry || 0, it.rz || 0);
     q.setFromEuler(e);
     m4.compose(new THREE.Vector3(it.x, it.y, it.z), q, new THREE.Vector3(it.s ?? 1, it.s ?? 1, it.s ?? 1));
     mesh.setMatrixAt(i, m4);
+    if (variance) mesh.setColorAt(i, new THREE.Color().setHSL(
+      hsl.h + rand(-variance, variance), clampUnit(hsl.s + rand(-0.06, 0.06)), clampUnit(hsl.l + rand(-0.1, 0.1))));
   });
   mesh.castShadow = true; mesh.receiveShadow = true;
   mesh.instanceMatrix.needsUpdate = true;
+  if (variance) mesh.instanceColor.needsUpdate = true;
   return mesh;
 }
 function rand(a, b) { return a + Math.random() * (b - a); }
+
+// 地形ごとの手続き的な模様(ノイズの染み)を描いたテクスチャ。地形ごとに1枚だけ作って使い回す
+const terrainTexCache = new Map();
+function terrainTexture(terrain) {
+  if (terrainTexCache.has(terrain)) return terrainTexCache.get(terrain);
+  const size = 256;
+  const c = document.createElement('canvas');
+  c.width = c.height = size;
+  const ctx = c.getContext('2d');
+  const base = new THREE.Color(TERRAIN_COLOR[terrain] ?? 0x446644);
+  ctx.fillStyle = `#${base.getHexString()}`;
+  ctx.fillRect(0, 0, size, size);
+  const dark = base.clone().multiplyScalar(0.72);
+  const light = base.clone().lerp(new THREE.Color(0xffffff), 0.3);
+  const blotches = terrain === 'water' || terrain === 'lake' ? 24 : 70;
+  for (let i = 0; i < blotches; i++) {
+    ctx.globalAlpha = rand(0.08, 0.2);
+    ctx.fillStyle = Math.random() < 0.5 ? `#${dark.getHexString()}` : `#${light.getHexString()}`;
+    const r = rand(6, 24);
+    ctx.beginPath();
+    ctx.ellipse(rand(0, size), rand(0, size), r, r * rand(0.5, 1), rand(0, Math.PI), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+  if (terrain === 'field') { // 畝(うね)の筋
+    ctx.strokeStyle = `#${dark.getHexString()}`;
+    ctx.lineWidth = 2;
+    for (let y = -size; y < size * 2; y += 14) {
+      ctx.beginPath(); ctx.moveTo(-size, y); ctx.lineTo(size * 2, y + size); ctx.stroke();
+    }
+  } else if (terrain === 'water' || terrain === 'lake') { // さざ波の筋
+    ctx.strokeStyle = `#${light.getHexString()}`;
+    ctx.globalAlpha = 0.4; ctx.lineWidth = 2;
+    for (let y = 10; y < size; y += 20) {
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(size, y + rand(-6, 6)); ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
+  } else if (terrain === 'mountains') { // 岩の割れ目
+    ctx.strokeStyle = `#${dark.getHexString()}`;
+    ctx.lineWidth = 1.4;
+    for (let i = 0; i < 18; i++) {
+      ctx.beginPath();
+      let x = rand(0, size), y = rand(0, size);
+      ctx.moveTo(x, y);
+      for (let k = 0; k < 4; k++) { x += rand(-20, 20); y += rand(-20, 20); ctx.lineTo(x, y); }
+      ctx.stroke();
+    }
+  } else if (terrain === 'gold') { // きらめき
+    ctx.fillStyle = '#fff6c8';
+    for (let i = 0; i < 30; i++) {
+      ctx.globalAlpha = rand(0.3, 0.8);
+      ctx.beginPath(); ctx.arc(rand(0, size), rand(0, size), rand(1, 2.6), 0, Math.PI * 2); ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  terrainTexCache.set(terrain, tex);
+  return tex;
+}
+function getTerrainMaterial(terrain) {
+  if (TERRAIN_MAT[terrain]) return TERRAIN_MAT[terrain];
+  const mat = new THREE.MeshStandardMaterial({
+    map: terrainTexture(terrain), roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
+  });
+  TERRAIN_MAT[terrain] = mat;
+  return mat;
+}
 
 // 数字チップの文字を書いた円いテクスチャ（出目ごとにキャッシュ）
 const numberTexCache = new Map();
@@ -236,8 +360,7 @@ export function renderBoard3D(game, uiState, overlay) {
     const pts = hexPointsOf(g, hex);
     const terrain = hex.fog ? 'fog' : hex.terrain;
     const height = TERRAIN_HEIGHT[terrain] ?? 10;
-    const mat = new THREE.MeshStandardMaterial({ color: TERRAIN_COLOR[terrain] ?? 0x446644, flatShading: true, roughness: 0.95, side: THREE.DoubleSide });
-    const tile = new THREE.Mesh(hexPrismGeometry(pts, height), mat);
+    const tile = new THREE.Mesh(hexPrismGeometry(pts, height), getTerrainMaterial(terrain));
     tile.receiveShadow = true; tile.castShadow = false;
     sceneGroup.add(tile);
     if (terrain === 'water' || terrain === 'lake') {
@@ -308,14 +431,14 @@ export function renderBoard3D(game, uiState, overlay) {
 
   [
     instancedFrom(GEO.trunk, MAT.bark, treeItems),
-    instancedFrom(GEO.canopy, MAT.leaf, canopyItems),
-    instancedFrom(GEO.sheep, MAT.sheep, sheepItems),
-    instancedFrom(GEO.wheat, MAT.wheat, wheatItems),
-    instancedFrom(GEO.mound, MAT.mound, moundItems),
-    instancedFrom(GEO.peak, MAT.peak, peakItems),
+    instancedFrom(GEO.canopy, MAT.leaf, canopyItems, 0.03),
+    instancedFrom(GEO.sheep, MAT.sheep, sheepItems, 0.02),
+    instancedFrom(GEO.wheat, MAT.wheat, wheatItems, 0.03),
+    instancedFrom(GEO.mound, MAT.mound, moundItems, 0.03),
+    instancedFrom(GEO.peak, MAT.peak, peakItems, 0.02),
     instancedFrom(GEO.snowCap, MAT.snow, snowItems),
     instancedFrom(GEO.dune, MAT.sand, duneItems),
-    instancedFrom(GEO.cactusBody, MAT.cactus, cactusItems),
+    instancedFrom(GEO.cactusBody, MAT.cactus, cactusItems, 0.02),
     instancedFrom(GEO.nugget, MAT.gold, nuggetItems),
   ].forEach((m) => { if (m) sceneGroup.add(m); });
 
@@ -405,7 +528,7 @@ function disposeGroup(group) {
   group.traverse((o) => {
     if (o.geometry && o.geometry !== GEO.trunk && !Object.values(GEO).includes(o.geometry)) o.geometry.dispose();
     const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
-    mats.forEach((m) => { if (!Object.values(MAT).includes(m)) m.dispose(); });
+    mats.forEach((m) => { if (!Object.values(MAT).includes(m) && !Object.values(TERRAIN_MAT).includes(m)) m.dispose(); });
   });
   while (group.children.length) group.remove(group.children[0]);
 }
@@ -423,6 +546,11 @@ function frameCamera(g) {
   controls.minDistance = maxR * 0.5;
   controls.maxDistance = maxR * 3.2;
   controls.update();
+  // 影の範囲を盤の大きさに合わせて締める(広すぎると影がぼやける)
+  const sd = maxR * 1.15;
+  sun.shadow.camera.left = -sd; sun.shadow.camera.right = sd;
+  sun.shadow.camera.top = sd; sun.shadow.camera.bottom = -sd;
+  sun.shadow.camera.updateProjectionMatrix();
 }
 
 function addNumberChip(x, z, baseY, n, hot, scale) {
