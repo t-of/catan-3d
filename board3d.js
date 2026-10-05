@@ -12,6 +12,7 @@
 import * as THREE from './vendor/three.module.min.js';
 import { OrbitControls } from './vendor/OrbitControls.js';
 import { RoomEnvironment } from './vendor/RoomEnvironment.js';
+import { RGBELoader } from './vendor/RGBELoader.js';
 
 const SCALE = 66; // main.jsのSCALEと同じ値（頂点のx,yをこの倍率でワールド座標にする）
 const REDUCE_MOTION = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
@@ -30,6 +31,12 @@ const RES_COLOR3D = { wood: 0x3f8a4a, brick: 0xc0643a, sheep: 0x8cc063, wheat: 0
 const TERRAIN_ROUGH = {
   forest: 0.95, pasture: 0.85, field: 0.7, hills: 0.9, mountains: 0.95, desert: 0.9,
   water: 0.2, gold: 0.5, lake: 0.2, castle: 0.8, pitch: 0.65, fog: 0.9,
+};
+// CC0の実写テクスチャ(Poly Haven、出典はtextures/CREDITS.md)を使う地形。
+// 水・金・城・ピッチ・霧は面積が小さく模様が目立たないので、今まで通り手続き的なCanvasの模様のまま。
+const TERRAIN_PHOTO = {
+  forest: './textures/forest.jpg', pasture: './textures/pasture.jpg', field: './textures/field.jpg',
+  hills: './textures/hills.jpg', mountains: './textures/mountains.jpg', desert: './textures/desert.jpg',
 };
 
 let scene, camera, renderer, controls, raycaster, pointer, clock, sun;
@@ -87,10 +94,16 @@ export function initBoard3D(container, onTap) {
   renderer.toneMappingExposure = 1.05;
   container.appendChild(renderer.domElement);
 
-  // 環境光(映り込み)をRoomEnvironmentから1回だけ作って使い回す
+  // 環境光(映り込み)。まずRoomEnvironmentですぐ出し、CC0の屋外HDRI(textures/CREDITS.md)が
+  // 読み込めたら差し替える(読み込みに失敗・時間がかかっても画面は止めない)。
   const pmrem = new THREE.PMREMGenerator(renderer);
   scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
-  pmrem.dispose();
+  new RGBELoader().load('./textures/sky.hdr', (hdr) => {
+    const envMap = pmrem.fromEquirectangular(hdr).texture;
+    scene.environment = envMap;
+    hdr.dispose();
+    pmrem.dispose();
+  }, undefined, () => { pmrem.dispose(); });
 
   scene.add(new THREE.HemisphereLight(0xdcefff, 0x1a2a1a, 0.6));
   sun = new THREE.DirectionalLight(0xfff2d6, 1.4);
@@ -309,11 +322,40 @@ function terrainTexture(terrain) {
   terrainTexCache.set(terrain, tex);
   return tex;
 }
+// 実写テクスチャ(diffuse + 法線)を地形ごとに1回だけ読み込んで使い回す。
+// タイル1枚の一辺はSCALE基準で一定なので、繰り返し回数も地形種類に関係なく固定でよい。
+const PHOTO_REPEAT = 1.6;
+const photoLoader = new THREE.TextureLoader();
+const photoTexCache = new Map();
+function loadPhotoTex(url, srgb) {
+  const tex = photoLoader.load(url);
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(PHOTO_REPEAT, PHOTO_REPEAT);
+  if (renderer) tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+  if (srgb) tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+function photoTerrainTextures(terrain) {
+  if (photoTexCache.has(terrain)) return photoTexCache.get(terrain);
+  const base = TERRAIN_PHOTO[terrain];
+  const out = {
+    map: loadPhotoTex(base, true),
+    normalMap: loadPhotoTex(base.replace(/(\.jpg)$/, '_nor$1'), false),
+  };
+  photoTexCache.set(terrain, out);
+  return out;
+}
 function getTerrainMaterial(terrain) {
   if (TERRAIN_MAT[terrain]) return TERRAIN_MAT[terrain];
-  const mat = new THREE.MeshStandardMaterial({
-    map: terrainTexture(terrain), roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
-  });
+  const mat = TERRAIN_PHOTO[terrain]
+    ? new THREE.MeshStandardMaterial({
+      ...photoTerrainTextures(terrain),
+      color: new THREE.Color(TERRAIN_COLOR[terrain]).lerp(new THREE.Color(0xffffff), 0.55),
+      roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
+    })
+    : new THREE.MeshStandardMaterial({
+      map: terrainTexture(terrain), roughness: TERRAIN_ROUGH[terrain] ?? 0.9, side: THREE.DoubleSide,
+    });
   TERRAIN_MAT[terrain] = mat;
   return mat;
 }
